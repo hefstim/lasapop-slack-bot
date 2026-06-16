@@ -1,0 +1,7 @@
+.env
+google_credentials.json
+bot_state.db
+bot.log
+venv/
+__pycache__/
+*.pyc
