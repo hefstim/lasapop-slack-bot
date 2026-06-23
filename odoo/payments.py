@@ -7,16 +7,16 @@ def now_utc_str() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _get_payment_info(client, invoice_id: int) -> tuple[str, str]:
-    """Return (payment method, receiving account) for a paid invoice, joining
-    multiple reconciled payments (e.g. partial payments from different accounts)."""
+def _get_payment_info(client, invoice_id: int) -> tuple[str, str, str]:
+    """Return (payment method, receiving account, payment date) for a paid invoice,
+    joining multiple reconciled payments (e.g. partial payments from different accounts)."""
     payments = client.search_read(
         "account.payment",
         [("reconciled_invoice_ids", "in", [invoice_id])],
-        ["payment_method_line_id", "journal_id"],
+        ["payment_method_line_id", "journal_id", "date"],
     )
     if not payments:
-        return "—", "—"
+        return "—", "—", "—"
 
     method_line_ids = [
         p["payment_method_line_id"][0] for p in payments
@@ -39,7 +39,9 @@ def _get_payment_info(client, invoice_id: int) -> tuple[str, str]:
 
     method = "、".join(dict.fromkeys(methods)) or "—"
     account = "、".join(dict.fromkeys(accounts)) or "—"
-    return method, account
+    dates = [p["date"] for p in payments if p.get("date")]
+    pay_date = max(dates) if dates else "—"
+    return method, account, pay_date
 
 
 def get_new_payments(since_ts: str) -> list[dict]:
@@ -60,13 +62,17 @@ def get_new_payments(since_ts: str) -> list[dict]:
 
     origins = [inv["invoice_origin"] for inv in invoices if inv.get("invoice_origin")]
     warehouse_by_order = {}
+    order_date_by_name = {}
     if origins:
         orders = client.search_read(
-            "sale.order", [("name", "in", origins)], ["name", "warehouse_id"],
+            "sale.order", [("name", "in", origins)], ["name", "warehouse_id", "date_order"],
         )
         warehouse_by_order = {
             o["name"]: o["warehouse_id"][1] for o in orders
             if isinstance(o.get("warehouse_id"), (list, tuple))
+        }
+        order_date_by_name = {
+            o["name"]: (o.get("date_order") or "")[:10] for o in orders
         }
 
     results = []
@@ -76,7 +82,7 @@ def get_new_payments(since_ts: str) -> list[dict]:
         currency = "₱"
         if isinstance(inv.get("currency_id"), (list, tuple)):
             currency = {"CNY": "¥", "USD": "$", "EUR": "€"}.get(inv["currency_id"][1], "₱")
-        payment_method, account = _get_payment_info(client, inv["id"])
+        payment_method, account, pay_date = _get_payment_info(client, inv["id"])
         order_name = inv.get("invoice_origin") or "—"
         results.append({
             "invoice_id":   inv["id"],
@@ -88,7 +94,9 @@ def get_new_payments(since_ts: str) -> list[dict]:
             "write_date":   inv.get("write_date", ""),
             "payment_method": payment_method,
             "account":      account,
+            "pay_date":     pay_date,
             "order_name":   order_name,
+            "order_date":   order_date_by_name.get(order_name, "—"),
             "warehouse":    warehouse_by_order.get(order_name, "—"),
         })
     return results

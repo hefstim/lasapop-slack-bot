@@ -563,6 +563,8 @@ def build_payment_blocks(inv: dict) -> list:
                     f"*Sales Rep:* {_mention(inv['salesperson'])}\n"
                     f"*Payment Method:* {inv['payment_method']}   "
                     f"*Account:* {inv['account']}\n"
+                    f"*Pay Date:* {inv.get('pay_date', '—')}   "
+                    f"*Order Date:* {inv.get('order_date', '—')}\n"
                     f"*Order:* {inv['order_name']}   *Warehouse:* {inv['warehouse']}"
                 ),
             },
