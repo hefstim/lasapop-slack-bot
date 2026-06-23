@@ -64,3 +64,53 @@ def export_missing_contacts(customers: list[dict]) -> str:
         sh.batch_update({"requests": del_reqs + add_reqs})
 
     return f"https://docs.google.com/spreadsheets/d/{Config.GOOGLE_SHEET_ID}/edit#gid={sheet_id}"
+
+
+def sync_contact_info_to_odoo() -> tuple[int, int, list[str]]:
+    """Read filled-in contact data from the sheet and write it back to Odoo.
+
+    Only writes fields that have a value in the sheet — never blanks out existing
+    Odoo data. Returns (updated, skipped, errors).
+    """
+    from odoo.client import get_client as _odoo
+    gc = _get_client()
+    sh = gc.open_by_key(Config.GOOGLE_SHEET_ID)
+    try:
+        ws = sh.worksheet(CONTACT_SHEET)
+    except Exception as e:
+        raise RuntimeError(f"Sheet \'{CONTACT_SHEET}\' not found: {e}")
+
+    rows = ws.get_all_records(head=1)
+    client = _odoo()
+    updated, skipped, errors = 0, 0, []
+
+    for row in rows:
+        pid = row.get("Partner ID")
+        if not pid:
+            continue
+        pid = int(pid)
+
+        values = {}
+        if str(row.get("Phone", "")).strip():
+            values["phone"] = str(row["Phone"]).strip()
+        if str(row.get("Email", "")).strip():
+            values["email"] = str(row["Email"]).strip()
+        if str(row.get("Facebook", "")).strip():
+            values["x_facebook"] = str(row["Facebook"]).strip()
+        if str(row.get("Viber", "")).strip():
+            values["x_viber"] = str(row["Viber"]).strip()
+
+        if not values:
+            skipped += 1
+            continue
+
+        try:
+            client.execute("res.partner", "write", [pid], values)
+            updated += 1
+            logger.info("Synced partner_id=%d fields=%s", pid, list(values.keys()))
+        except Exception as e:
+            name = str(row.get("Customer Name", f"id={pid}"))
+            errors.append(f"{name}: {e}")
+            logger.error("Failed to sync partner_id=%d: %s", pid, e)
+
+    return updated, skipped, errors

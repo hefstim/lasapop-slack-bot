@@ -38,6 +38,7 @@ HELP_TEXT = (
     "`@OdooBot legacy` — Export invoices overdue >30 days to Google Sheet for manual review\n"
     "`@OdooBot quotations` — Pending quotation follow-up\n"
     "`@OdooBot stock` — Low stock alert\n"
+    "`@OdooBot contactsync` — Sync Customer Contact Info sheet → Odoo\n"
     "`@OdooBot help` — Show this help message"
 )
 
@@ -103,6 +104,37 @@ def register_handlers(app: App):
                     )
 
             threading.Thread(target=_run_specific, daemon=True).start()
+            return
+
+        # ── contactsync: read Customer Contact Info sheet → write to Odoo ──────
+        if keyword == "contactsync":
+            ack_msg = client.chat_postMessage(
+                channel=channel,
+                text=":hourglass_flowing_sand: Syncing *Customer Contact Info* sheet to Odoo...",
+            )
+
+            def _run_contactsync():
+                try:
+                    from google_sheets.contact_exporter import sync_contact_info_to_odoo
+                    updated, skipped, errors = sync_contact_info_to_odoo()
+                    lines = [f":white_check_mark: Sync complete — *{updated}* updated, *{skipped}* skipped (no data)."]
+                    if errors:
+                        lines.append(":warning: Errors:")
+                        lines.extend(f"  • {e}" for e in errors[:10])
+                    client.chat_update(
+                        channel=channel,
+                        ts=ack_msg["ts"],
+                        text="\n".join(lines),
+                    )
+                except Exception as e:
+                    logger.error("contactsync failed: %s", e)
+                    client.chat_update(
+                        channel=channel,
+                        ts=ack_msg["ts"],
+                        text=f":x: contactsync failed: {e}",
+                    )
+
+            threading.Thread(target=_run_contactsync, daemon=True).start()
             return
 
         if keyword not in COMMANDS:
