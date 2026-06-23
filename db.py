@@ -1,9 +1,35 @@
 """SQLite state tracker — records what reminders were sent and what actions were taken."""
+import logging
+import os
+import shutil
 import sqlite3
-from datetime import date
+from datetime import date, datetime
+from pathlib import Path
+
 from config import Config
 
-DB_PATH = "bot_state.db"
+_BASE = Path(__file__).parent
+DB_PATH = str(_BASE / "bot_state.db")
+
+_SQLITE_MAGIC = b"SQLite format 3\x00"
+logger = logging.getLogger(__name__)
+
+
+def _check_db_file():
+    """If DB file exists but is not a valid SQLite file, back it up and remove it."""
+    path = Path(DB_PATH)
+    if not path.exists():
+        return
+    with path.open("rb") as f:
+        header = f.read(16)
+    if header != _SQLITE_MAGIC:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup = path.with_name(f"bot_state.db.corrupted_{ts}")
+        shutil.move(str(path), str(backup))
+        logger.error(
+            "DB file was not a valid SQLite database — backed up to %s and will recreate.",
+            backup.name,
+        )
 
 
 def get_conn():
@@ -13,6 +39,7 @@ def get_conn():
 
 
 def init_db():
+    _check_db_file()
     with get_conn() as conn:
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS customer_reminders (
@@ -93,6 +120,7 @@ def init_db():
                 alerted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
+    os.chmod(DB_PATH, 0o600)
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
