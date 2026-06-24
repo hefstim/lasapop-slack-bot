@@ -610,5 +610,7 @@ def build_integrity_alert_text(issues: list[dict]) -> str:
 def build_new_customer_missing_contact_text(customers: list[dict]) -> str:
     lines = [f"📇 *New customer(s) missing contact info — {len(customers)}*"]
     for c in customers:
-        lines.append(f"• {c['name']} — missing: {', '.join(c['missing'])}")
+        creator = c.get("created_by", "")
+        suffix = f"  _created by {creator}_" if creator else ""
+        lines.append(f"• {c['name']} — missing: {', '.join(c['missing'])}{suffix}")
     return "\n".join(lines)

@@ -122,7 +122,7 @@ def get_new_customers_missing_contact(since_ts: str) -> list[dict]:
     partners = client.search_read(
         "res.partner",
         [("customer_rank", ">", 0), ("create_date", ">", since_ts)],
-        ["id", "name", "phone", "email", "x_facebook", "x_viber"],
+        ["id", "name", "phone", "email", "x_facebook", "x_viber", "create_uid"],
     )
 
     results = []
@@ -134,9 +134,13 @@ def get_new_customers_missing_contact(since_ts: str) -> list[dict]:
             ] if not val
         ]
         if missing:
+            creator = ""
+            if isinstance(p.get("create_uid"), (list, tuple)):
+                creator = p["create_uid"][1]
             results.append({
                 "partner_id": p["id"],
                 "name": p["name"],
                 "missing": missing,
+                "created_by": creator,
             })
     return results
