@@ -371,7 +371,7 @@ def job_new_payments():
         logger.warning("job_new_payments: skipped %d payments with pay_date older than 30 days", stale)
 
     # Guard: cap at 50 per run to prevent runaway floods.
-    MAX_PER_RUN = 50
+    MAX_PER_RUN = 20
     if len(fresh) > MAX_PER_RUN:
         logger.warning("job_new_payments: %d payments found, capping at %d for this run", len(fresh), MAX_PER_RUN)
         fresh = fresh[:MAX_PER_RUN]
