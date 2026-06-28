@@ -222,6 +222,7 @@ def _write_main_sheet(ws: gspread.Worksheet, sh: gspread.Spreadsheet,
     # 6=Orders  7=History  8=LastPurchase  9=DaysInactive  10=SalesRep
     # 11=Status  12=Notes  13=LastUpdatedBy  14=PartnerID
     reqs = [
+        _clear_validation(sheet_id),
         _freeze_row(sheet_id),
         _header_style(sheet_id, len(MAIN_HEADERS), HEADER_COLOR),
         _currency_format(sheet_id, col_idx=7, start_row=1, end_row=n + 1),  # col H = Total Purchase History
@@ -276,6 +277,7 @@ def _write_tracker_sheet(ws: gspread.Worksheet, sh: gspread.Spreadsheet,
 
     # Formatting requests
     reqs = [
+        _clear_validation(sheet_id),
         _freeze_row(sheet_id),
         _header_style(sheet_id, len(TRACKER_HEADERS), TRACKER_HDR_COLOR),
         _currency_format(sheet_id, col_idx=7, start_row=1, end_row=n + 1),  # col H = Total Purchase History
@@ -389,6 +391,18 @@ def _currency_format(sheet_id: int, col_idx: int, start_row: int, end_row: int) 
         "fields": "userEnteredFormat.numberFormat",
     }}
 
+
+
+def _clear_validation(sheet_id: int) -> dict:
+    """Clear all data-validation rules from the sheet (entire grid)."""
+    return {"setDataValidation": {
+        "range": {
+            "sheetId": sheet_id,
+            "startRowIndex": 0, "endRowIndex": 2000,
+            "startColumnIndex": 0, "endColumnIndex": 20,
+        }
+        # no "rule" key = API clears all validation
+    }}
 
 def _dropdown(sheet_id: int, col_idx: int, start_row: int, end_row: int, options: list) -> dict:
     return {"setDataValidation": {
