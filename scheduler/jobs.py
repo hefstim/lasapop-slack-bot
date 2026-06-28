@@ -361,8 +361,23 @@ def job_new_payments():
         logger.error("Odoo query failed (payments): %s", e)
         return
 
+    # Guard: skip payments whose pay_date is more than 30 days ago —
+    # a bulk write_date refresh in Odoo can make old records look "new".
+    from datetime import date as _date, timedelta as _td
+    cutoff = (_date.today() - _td(days=30)).isoformat()
+    fresh = [p for p in payments if (p.get("pay_date") or "9999") >= cutoff]
+    stale = len(payments) - len(fresh)
+    if stale:
+        logger.warning("job_new_payments: skipped %d payments with pay_date older than 30 days", stale)
+
+    # Guard: cap at 50 per run to prevent runaway floods.
+    MAX_PER_RUN = 50
+    if len(fresh) > MAX_PER_RUN:
+        logger.warning("job_new_payments: %d payments found, capping at %d for this run", len(fresh), MAX_PER_RUN)
+        fresh = fresh[:MAX_PER_RUN]
+
     new_ts = since_ts
-    for inv in payments:
+    for inv in fresh:
         try:
             _post(slack, channel=channel,
                   blocks=build_payment_blocks(inv),
@@ -372,6 +387,12 @@ def job_new_payments():
             time.sleep(1.2)
         except Exception as e:
             logger.error("Failed to post payment %s: %s", inv["invoice_name"], e)
+
+    # Always advance the cursor to the max write_date seen (including skipped/stale),
+    # so we never re-scan the same batch on the next run.
+    for inv in payments:
+        if inv["write_date"] > new_ts:
+            new_ts = inv["write_date"]
 
     db.set_state("last_payment_ts", new_ts)
 
