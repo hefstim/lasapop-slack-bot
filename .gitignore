@@ -5,3 +5,5 @@ bot.log
 venv/
 __pycache__/
 *.pyc
+bot_state.db.corrupted_*
+backups/

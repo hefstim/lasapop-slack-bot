@@ -49,14 +49,12 @@ tz = pytz.timezone(Config.TIMEZONE)
 def build_scheduler() -> BackgroundScheduler:
     scheduler = BackgroundScheduler(timezone=tz)
 
-    # Every 5 min — poll for new confirmed orders
-    scheduler.add_job(job_new_orders, "interval", minutes=5, id="new_orders")
-
-    # Every 5 min — poll for new payments
-    scheduler.add_job(job_new_payments, "interval", minutes=5, id="new_payments")
-
-    # Every 5 min — poll for new customers missing contact info (phone/email/Facebook/Viber)
-    scheduler.add_job(job_new_customer_contact_check, "interval", minutes=5, id="new_customer_contact_check")
+    # Every 5 min, 08:00–19:55 only — nobody's watching Slack at night, so these
+    # real-time pollers stand down 20:00–08:00. Cursor-based, so whatever came in
+    # overnight is caught up in one batch the moment 08:00 hits — nothing is lost.
+    scheduler.add_job(job_new_orders, CronTrigger(hour="8-19", minute="*/5", timezone=tz), id="new_orders")
+    scheduler.add_job(job_new_payments, CronTrigger(hour="8-19", minute="*/5", timezone=tz), id="new_payments")
+    scheduler.add_job(job_new_customer_contact_check, CronTrigger(hour="8-19", minute="*/5", timezone=tz), id="new_customer_contact_check")
 
     # Every 4 hours — check if excluded customers have reactivated
     scheduler.add_job(job_reactivation_check, "interval", hours=4, id="reactivation_check")
@@ -101,6 +99,10 @@ def build_scheduler() -> BackgroundScheduler:
 
     # 19:00 — cash balance verification (Odoo cash income vs Google Sheet records)
     scheduler.add_job(job_cash_balance_verify, CronTrigger(hour=19, minute=0, timezone=tz), id="cash_balance_verify")
+
+    # Every 1 hour — hot backup of bot_state.db (last 6 kept), so a future
+    # corruption event doesn't wipe out all polling cursors / dedup state
+    scheduler.add_job(db.backup_db, "interval", hours=1, id="backup_state_db")
 
     return scheduler
 
