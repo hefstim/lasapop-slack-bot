@@ -3,6 +3,7 @@ import logging
 import os
 import shutil
 import sqlite3
+import threading
 from contextlib import contextmanager
 from datetime import date, datetime
 from pathlib import Path
@@ -18,6 +19,13 @@ BACKUP_KEEP = 6
 
 _SQLITE_MAGIC = b"SQLite format 3\x00"
 logger = logging.getLogger(__name__)
+
+# APScheduler runs multiple jobs concurrently in separate threads (e.g. the
+# three 5-min pollers all fire at the same instant). Without this lock, two
+# threads could both see a corrupted header and race on shutil.move-ing the
+# same path — the loser gets an unhandled FileNotFoundError instead of a
+# clean recovery.
+_check_lock = threading.Lock()
 
 _SCHEMA = """
     CREATE TABLE IF NOT EXISTS customer_reminders (
@@ -121,36 +129,41 @@ def _check_db_file():
     """If DB file exists but is not a valid SQLite file, back it up, recreate
     the schema, and alert admins. Called before every connection (not just at
     startup) so corruption mid-run self-heals within one job cycle instead of
-    silently failing until someone notices and restarts the process."""
-    path = Path(DB_PATH)
-    if not path.exists():
-        return
-    with path.open("rb") as f:
-        header = f.read(16)
-    if header == _SQLITE_MAGIC:
-        return
+    silently failing until someone notices and restarts the process.
 
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    backup = path.with_name(f"bot_state.db.corrupted_{ts}")
-    shutil.move(str(path), str(backup))
-    logger.error(
-        "DB file was not a valid SQLite database — backed up to %s and recreated.",
-        backup.name,
-    )
+    Guarded by a lock — several jobs fire at the same instant on separate
+    threads, and without it two threads could both see the bad header and
+    race to shutil.move the same path."""
+    with _check_lock:
+        path = Path(DB_PATH)
+        if not path.exists():
+            return
+        with path.open("rb") as f:
+            header = f.read(16)
+        if header == _SQLITE_MAGIC:
+            return
 
-    conn = sqlite3.connect(DB_PATH, timeout=30)
-    try:
-        _create_schema(conn)
-    finally:
-        conn.close()
-    os.chmod(DB_PATH, 0o600)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup = path.with_name(f"bot_state.db.corrupted_{ts}")
+        shutil.move(str(path), str(backup))
+        logger.error(
+            "DB file was not a valid SQLite database — backed up to %s and recreated.",
+            backup.name,
+        )
 
-    _alert_admins(
-        f"`bot_state.db` was corrupted and has been auto-recovered "
-        f"(bad copy saved as `{backup.name}`). Polling cursors were reset — "
-        f"a same-day reminder could be sent twice, and today's already-notified "
-        f"orders/payments may briefly re-fire."
-    )
+        conn = sqlite3.connect(DB_PATH, timeout=30)
+        try:
+            _create_schema(conn)
+        finally:
+            conn.close()
+        os.chmod(DB_PATH, 0o600)
+
+        _alert_admins(
+            f"`bot_state.db` was corrupted and has been auto-recovered "
+            f"(bad copy saved as `{backup.name}`). Polling cursors were reset — "
+            f"a same-day reminder could be sent twice, and today's already-notified "
+            f"orders/payments may briefly re-fire."
+        )
 
 
 @contextmanager
