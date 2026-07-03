@@ -33,8 +33,13 @@ def _check_db_file():
 
 
 def get_conn():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    # WAL 模式：写入只追加到 .db-wal，主文件在 checkpoint 前不变动，
+    # 进程崩溃后主文件始终完好，彻底消除 "file is not a database" 风险。
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=30000")
     return conn
 
 

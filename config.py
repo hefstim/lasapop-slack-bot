@@ -22,6 +22,10 @@ class Config:
     SLACK_CHANNEL_WAREHOUSE = os.getenv("SLACK_CHANNEL_WAREHOUSE", "warehouse")
     SLACK_CHANNEL_MANAGEMENT = os.getenv("SLACK_CHANNEL_MANAGEMENT", "general")
     SLACK_CHANNEL_ODOO_REPORT = os.getenv("SLACK_CHANNEL_ODOO_REPORT", "C0BAQCGCY8L")
+    # 员工每日现金支出上报频道
+    SLACK_CHANNEL_CASH = os.getenv("SLACK_CHANNEL_CASH", "")
+    # 线上支付凭证上传频道（只读，统计图片数量）
+    SLACK_CHANNEL_PAYMENT_PROOFS = os.getenv("SLACK_CHANNEL_PAYMENT_PROOFS", "C0ARCDELSAJ")
 
     # Business Rules
     DORMANT_CUSTOMER_DAYS = int(os.getenv("DORMANT_CUSTOMER_DAYS", "90"))

@@ -1,6 +1,8 @@
 """Entry point — starts scheduler + Slack socket connection."""
 import logging
+import signal
 import sys
+from logging.handlers import RotatingFileHandler
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 import pytz
@@ -26,15 +28,18 @@ from scheduler.jobs import (
     job_integrity_check,
     job_new_customer_contact_check,
 )
+from scheduler.cash_jobs import job_cash_balance_verify, job_online_payment_digest
 from odoo.orders import get_max_order_id
 from odoo.payments import now_utc_str
 
+_log_file = str(__import__("pathlib").Path(__file__).parent / "bot.log")
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler(str(__import__("pathlib").Path(__file__).parent / "bot.log"), encoding="utf-8"),
+        # 单文件最大 5MB，保留 3 个备份，共占 ~20MB，防止磁盘写满导致 DB 损坏
+        RotatingFileHandler(_log_file, maxBytes=5*1024*1024, backupCount=3, encoding="utf-8"),
     ],
 )
 logger = logging.getLogger(__name__)
@@ -91,10 +96,22 @@ def build_scheduler() -> BackgroundScheduler:
     # 1st of each month 09:00 — monthly report for last month
     scheduler.add_job(job_monthly_report, CronTrigger(day=1, hour=9, minute=0, timezone=tz), id="monthly_report")
 
+    # 18:30 — online payment digest (Odoo payments + proof image count from Slack)
+    scheduler.add_job(job_online_payment_digest, CronTrigger(hour=18, minute=30, timezone=tz), id="online_payment_digest")
+
+    # 19:00 — cash balance verification (Odoo cash income vs Google Sheet records)
+    scheduler.add_job(job_cash_balance_verify, CronTrigger(hour=19, minute=0, timezone=tz), id="cash_balance_verify")
+
     return scheduler
 
 
 def main():
+    # 收到 SIGTERM（systemd stop）时优雅退出，确保 SQLite WAL checkpoint 完成
+    def _handle_sigterm(signum, frame):
+        logger.info("Received SIGTERM — shutting down gracefully.")
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+
     logger.info("Starting Odoo-Slack Bot...")
 
     # Verify Odoo connection
