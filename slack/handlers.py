@@ -50,31 +50,53 @@ def register_handlers(app: App):
     # `app_mention` on this Slack app fires unreliably — sometimes not at all
     # (historically, zero occurrences of the mention-only ack text like
     # ":hourglass_flowing_sand: Running" across days of bot.log), sometimes
-    # redelivered twice for one real message (observed directly on the LasaPop
-    # deployment of this same codebase: two `hr.expense` records created 1.2s
-    # apart from a single `expense` mention). A `message`-event fallback is
-    # also registered below so mentions still get through when `app_mention`
-    # stays silent. Since either or both may fire for the same underlying
-    # message, every dispatch is deduplicated by (channel, ts) before doing
-    # anything with side effects (Odoo writes, scheduler jobs, Slack posts).
+    # redelivered twice for one real message (observed directly: two
+    # `hr.expense` records created 1.2s apart from a single `expense` mention).
+    # A `message`-event fallback is also registered below so mentions still
+    # get through when `app_mention` stays silent. Since either or both may
+    # fire for the same underlying message, every dispatch is deduplicated by
+    # (channel, ts) before doing anything with side effects (Odoo writes,
+    # scheduler jobs, Slack posts).
     _seen_event_ids: set[str] = set()
     _seen_event_order: list[str] = []
+    _seen_lock = threading.Lock()
     _SEEN_CAP = 500
 
     def _already_processed(channel: str, ts: str) -> bool:
         key = f"{channel}:{ts}"
-        if key in _seen_event_ids:
-            return True
-        _seen_event_ids.add(key)
-        _seen_event_order.append(key)
-        if len(_seen_event_order) > _SEEN_CAP:
-            oldest = _seen_event_order.pop(0)
-            _seen_event_ids.discard(oldest)
-        return False
+        # Bolt can invoke listeners for concurrent events on separate threads —
+        # without the lock, two near-simultaneous deliveries of the same event
+        # could both read "not seen yet" before either finishes writing it,
+        # defeating the whole point of this guard.
+        with _seen_lock:
+            if key in _seen_event_ids:
+                return True
+            _seen_event_ids.add(key)
+            _seen_event_order.append(key)
+            if len(_seen_event_order) > _SEEN_CAP:
+                oldest = _seen_event_order.pop(0)
+                _seen_event_ids.discard(oldest)
+            return False
 
     @app.event("app_mention")
     def handle_mention(body, say, client):
         _dispatch_mention(body.get("event", {}), say, client)
+
+    _bot_id_cache: dict[str, str] = {}
+
+    def _get_bot_id(client) -> str:
+        # Slack renders a mention as <@USERID>, but if a user copy-pastes an
+        # older message instead of retyping "@" and picking from autocomplete,
+        # the client can carry over a <@BOTID> reference instead (observed
+        # directly in #exp-approval: two `expense` submissions with
+        # <@B0BG01CFK8U> instead of <@U0BFW9JPX7U> that silently never
+        # dispatched). Treat both forms as a valid mention.
+        if "id" not in _bot_id_cache:
+            try:
+                _bot_id_cache["id"] = client.auth_test().get("bot_id", "")
+            except Exception:
+                _bot_id_cache["id"] = ""
+        return _bot_id_cache["id"]
 
     @app.event("message")
     def handle_message_mention(body, say, client, context):
@@ -82,8 +104,10 @@ def register_handlers(app: App):
         if event.get("subtype") or event.get("bot_id"):
             return  # ignore edits, deletions, and our own bot's messages
         bot_user_id = context.get("bot_user_id", "")
+        bot_id = _get_bot_id(client)
         text = event.get("text", "")
-        if not bot_user_id or f"<@{bot_user_id}>" not in text:
+        mentioned = (bot_user_id and f"<@{bot_user_id}>" in text) or (bot_id and f"<@{bot_id}>" in text)
+        if not mentioned:
             return
         _dispatch_mention(event, say, client)
 
