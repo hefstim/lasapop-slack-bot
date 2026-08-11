@@ -1,5 +1,7 @@
 # Odoo ↔ Slack Bots
 
+> [中文版](README.zh-CN.md)
+
 One codebase, two independent live deployments — HEFS (Philippines) and
 LasaPop. Both bridge Odoo (XML-RPC) with Slack: poll Odoo on a schedule, post
 notification/interactive cards, let staff act with one click, export to

@@ -1,0 +1,274 @@
+# Odoo ↔ Slack 机器人（中文版）
+
+> [English version](README.md)
+
+一套代码，两个独立运行的实际部署——HEFS（菲律宾）和 LasaPop。两边都是把 Odoo（XML-RPC）和 Slack 打通：定时轮询 Odoo、往 Slack 推通知/交互卡片、让员工一键操作、导出数据到 Google Sheets。每个部署有自己独立的 systemd 服务、独立的 `.env`、独立的 `bot_state.db`，功能上也已经互相分叉——**但两个目录是同一个 GitHub 仓库的 git checkout**，做任何 git 操作前务必先看下面"⚠️ 共用 git remote"那一节。
+
+| | HEFS | LasaPop |
+|---|---|---|
+| 路径 | `/opt/odoo-slack-bot`（服务器 `japan_oracle`，150.230.63.12） | `/opt/lasapop-slack-bot`（同一台服务器） |
+| systemd 服务 | `odoo-slack-bot.service` | `lasapop-slack-bot.service` |
+| Slack 身份 | `@odoobot`，HEFS 工作区 | `@lasapop_bot`，LasaPop 工作区 |
+| Odoo | `https://www.02ph.com`，db 见 `.env` | `http://localhost:8069`，db 名 `lasapop` |
+| 运营状态 | 完全在线——真实的订单/付款/发票流水 | **业务尚未正式运营**——`main.py` 里大部分 Odoo 同步任务都被禁用（见下文），目前只有 Slack 原生的报销/现金功能是活的 |
+
+## 共享架构
+
+一个长期运行的 Python 进程（`main.py`）同时做两件事：
+
+- **APScheduler** —— `scheduler/jobs.py` 里的后台任务，按 cron/interval 调度。
+- **Slack Bolt（Socket Mode）** —— `slack/handlers.py` 里的 `@mention` 命令 + 按钮点击，实时响应。
+
+```
+main.py                  入口 —— 构建调度器、启动 Slack Socket Mode
+config.py                所有配置，从 .env 读取
+db.py                    SQLite（bot_state.db）—— 轮询游标、提醒/去重状态、
+                          数据库损坏自愈逻辑（见下方"已知问题"）
+odoo/
+  client.py              XML-RPC 封装。持久连接断开时自动重连重试一次。
+  orders.py / payments.py / invoices.py / quotations.py / inventory.py
+  customers.py / reports.py / integrity.py
+  expenses.py             仅 LasaPop —— 通过 Odoo 提交/审批/拒绝 hr.expense
+scheduler/
+  jobs.py                 每个定时任务一个函数 —— 定时任务调用 Slack
+                           chat.postMessage 的唯一入口
+  cash_jobs.py             仅 LasaPop —— 现金结余核对（代码已写好，但目前
+                           并未接入 main.py 的调度器，见下文）
+slack/
+  app.py                  Slack Bolt App 初始化 + Socket Mode handler
+  handlers.py              @mention 命令 + 按钮/shortcut/modal 处理
+  messages.py               Block Kit / 文本消息构建
+google_sheets/
+  exporter.py / invoice_exporter.py / contact_exporter.py / cash_reader.py（LasaPop）
+```
+
+> **死代码提醒：** 两个部署的**仓库根目录**下也都各自躺着一份
+> `handlers.py`、`messages.py`、`db.py`、`jobs.py`、`customers.py`、
+> `reports.py`——这些是重构成包结构之前留下的旧文件，`main.py` 并不会
+> import 它们。不确定哪份文件是真正生效的，就去看 `main.py` 的 import，
+> 别看根目录。
+
+### `bot_state.db`（SQLite，git 不跟踪，每个部署各自一份）
+
+| 表 | 用途 |
+|---|---|
+| `notification_state` | key/value 轮询游标：`last_order_id`、`last_payment_ts`、`integrity_last_check_ts`、`last_customer_check_ts` |
+| `customer_reminders`、`invoice_reminders`、`quotation_reminders`、`stock_alerts` | 每条提醒卡片一行 —— 支撑交互按钮 + 同日去重 |
+| `excluded_customers` | "不再购买"黑名单 |
+| `integrity_alerted_orders` | 30 天未开票检查已经提醒过的订单 |
+| `expense_requests`、`cash_topups` | 仅 LasaPop —— 报销审批 + 现金基金记录 |
+
+滚动备份存在 `backups/` 目录，HEFS 每小时一份，LasaPop 每 15 分钟一份。
+
+## HEFS —— 当前生效的任务（`scheduler/jobs.py`，全部启用）
+
+| 任务 | 调度 | 推送到 |
+|---|---|---|
+| `job_new_orders`、`job_new_payments`、`job_new_customer_contact_check` | 每 5 分钟，08–19 点 | sales / finance / odoo-report |
+| `job_integrity_check` | 每小时 | odoo-report |
+| `job_reactivation_check` | 每 4 小时 | management |
+| `job_sync_wont_buy` | 每 2 小时 | —（不发消息） |
+| `job_low_stock` | 每天 08:00 | warehouse |
+| `job_dormant_customers` | 每天 09:00 | sales |
+| `job_overdue_invoices` / `job_export_overdue_invoices` | 每天 09:30 / 09:35 | finance |
+| `job_pending_quotations` | 每天 10:00 | sales |
+| `job_daily_report` | 每天 18:00 | management |
+| `job_weekly_report` | 周一 08:30 | management |
+| `job_export_legacy_invoices` | 周一 09:45 | finance |
+| `job_monthly_report` | 每月 1 号 09:00 | management |
+
+**频道坑点：** HEFS 的 `.env` 里，`SLACK_CHANNEL_SALES` = `SLACK_CHANNEL_FINANCE`
+= `SLACK_CHANNEL_WAREHOUSE` = `SLACK_CHANNEL_MANAGEMENT`，全都是字面量频道名
+`odoo-report`——也就是说**所有任务实际上都推到同一个频道**"odoo-report"
+（频道 ID `C0BAQCGCY8L`，运行时按名称解析）。另外还有一个**单独的**配置项
+`SLACK_CHANNEL_ODOO_REPORT`，配的是**另一个不同的**频道 ID
+（`C0ARTKSPG81`），只被 `job_integrity_check` 和
+`job_new_customer_contact_check` 使用。不要想当然认为"odoo-report"就是指
+一个频道——具体要看某个任务实际读的是哪个配置项。
+
+`@mention` 命令：`report`/`daily`、`weekly`、`monthly [YYYY-MM]`、
+`thismonth`、`dormant`/`customers`、`invoices`、`invoicesheet`、`legacy`、
+`quotations`/`quotes`、`stock`、`help`。
+
+## LasaPop —— 哪些活着，哪些停用
+
+**目前只有 `job_integrity_check`（每小时）和 `db.backup_db`（每 15 分钟）
+是启用状态。** 共享 `scheduler/jobs.py` 列表里的其他所有任务——新订单/
+新付款、各种报表、沉睡客户、逾期发票、低库存、客户重新激活、Won't-Buy
+同步——都在 `main.py` 里被 `# [停用-未运营]` 注释掉了。这是故意的：
+LasaPop 的业务目前还没有真实订单流水跑进 Odoo（2026-08-11 确认：
+`sale.order` 记录数为 0）。**如果发现 LasaPop 这边 `job_new_orders`
+"不工作"，先去看 `main.py`——这是设计上的停用，不是故障。**
+
+另外还有一整套现金核对子系统（`scheduler/cash_jobs.py`、
+`google_sheets/cash_reader.py` —— `job_cash_balance_verify`，每晚 Odoo
+收款 vs Google Sheet 记录的双重核对）代码已经写好，但**目前根本没有
+`add_job()` 调用把它接入调度器**（连注释掉的痕迹都没有，就是从没加进去
+过）。已经造好了，但还没上线。
+
+### 真正在跑的：报销审批 + 现金记录（Slack 原生，不依赖 Odoo 订单）
+
+`@mention` 命令：`expense <金额> <说明>`、`expensetotal`、
+`cashin <金额> <备注>`（仅管理员，见 `Config.ADMIN_USER_IDS`）、
+`balance`、`help`。同样的操作也能通过 Slack shortcut（⚡ 图标）触发：
+*提交支出*、*查询现金统计*、*充值现金*。
+
+流程：`expense` 提及 → 创建并提交一条草稿 `hr.expense`
+（`odoo/expenses.py::create_and_submit_expense`）→ 把审批卡片发到
+`SLACK_CHANNEL_EXPENSE_APPROVAL`（`#exp-approval`）→ 管理员点 Approve/
+Refuse → 调用 `approve_expense`/`refuse_expense`（拒绝走的是
+`hr.expense.refuse.wizard`；直接在 `hr.expense` 记录上调用
+`action_refuse()` 只会弹出一个 UI 对话框，并不会真的拒绝）→ 更新本地
+`expense_requests` 那一行，原地编辑 Slack 消息。提及消息里如果附带了图片
+会被当作报销凭证下载下来，存成 `ir.attachment`
+（`attach_receipt`）——凭证上传失败只会记日志，不会阻塞报销本身的提交。
+
+`Config.EXPENSE_EMPLOYEE_MAP`（`.env` 里 `Slack用户ID=Odoo员工ID` 的键值
+对）是 Slack 到 Odoo 员工身份映射的唯一来源；提交人不在这个映射表里会被
+友好地拒绝，不会报错崩溃。
+
+这个功能故意不接入正式的 Odoo 财务记账（不走现金日记账，不调用
+`action_post`/`action_pay`）。真正的记账方式是每月从银行取一笔现金，
+通过另一个完全独立的、AI 对话驱动的 MCP 工具
+（`/root/.hermes/odoo_mcp_lasapop.py` 里的 `record_expense`，用的是完全
+不同的 Odoo 模型）把这一整笔提现记一次账。这个功能里停在 `approved`
+状态（从未 posted/paid）的 `hr.expense` 记录，本身**就是**这笔钱具体花
+到哪里去的明细账本。除非用户实际需求变了，否则不要建议把这个功能"打通"
+到正式财务记账里——那样只会跟现有的整笔记账方式重复/冲突，解决不了任何
+问题。
+
+## ⚠️ 共用 git remote —— 做任何 git 操作前先看这里
+
+`/opt/odoo-slack-bot` 和 `/opt/lasapop-slack-bot` 都是**同一个仓库**
+`git@github.com:hefstim/odoo-slack-bot.git` 的 git clone，都在 `main`
+分支上。LasaPop 是从 HEFS 的代码起步的，后来通过**大量从未提交、从未推送
+的本地修改**（报销/现金功能、停用的任务、不同的配置）分叉出去——所以在
+任意一个目录里 `git status` 几乎总能看到一堆跟你当前要做的事情无关的、
+早就存在的已修改/未跟踪文件。提交或推送之前：
+
+1. **先看 `git status`，不要无脑 `git add -A`**——某个文件里可能已经混着
+   历史遗留的改动和你刚做的改动。遇到这种情况，用
+   `git diff > /tmp/x.patch` 把完整 diff 导出来，手工把 patch 精简到只剩
+   你自己的那部分改动，再用 `git apply --cached` 应用——不要把整个文件
+   的 diff 一起提交。
+2. **绝不提交 `.env.bak-*` 文件**（LasaPop 那边就有好几个未跟踪的，
+   大概率含密钥）。
+3. **从一边 push 之后，另一边的 `origin/main` 就落后了。** HEFS push 完
+   之后，LasaPop 本地 `main` 需要先
+   `git fetch && git rebase --autostash origin/main` 才能再 push（反过来
+   也一样）。`--autostash` 很关键——两边目录都有必须在 rebase 过程中
+   保留下来的未提交本地改动。
+4. **如果同一个逻辑修复被分别搬到了两边**，rebase 时可能会**自动丢弃你
+   的 commit**（Git 识别出这个 patch 内容已经在上游了——不需要再 push，
+   已经是最新的了），**也可能冲突**（如果两边版本有细微差异，比如一边
+   多了线程安全或额外功能代码）。出现冲突要手工解决——尤其是"旧版本一侧
+   为空"这种冲突块，千万别信任脚本化/正则表达式的自动解决方式；一个偷懒
+   的正则表达式可能会把夹在两个冲突标记之间的正常代码给悄悄吞掉。正确
+   做法是把冲突文件下载下来，一块一块对照着人工解决，验证
+   `python3 -m py_compile` 通过、没有重复的 `def`，再继续 rebase。
+
+## 已知问题 / 排错手册
+
+**"`job_new_orders` 老是被跳过"（`journalctl` 里看到
+`Execution of job "job_new_orders..." skipped: maximum number of running
+instances reached (1)`）**—— 说明这个任务卡住了，不是空闲。用
+`journalctl -u <service> --since <该任务最后一条 "Running job" 的时间>`
+看它到底卡在哪。最常见的原因见下面。
+
+**数据库损坏导致游标重置 → 全量历史订单刷屏（2026-08-11 定位，HEFS）：**
+`db.py` 的 `_check_db_file()` 会自愈损坏的 `bot_state.db`（SQLite 文件头
+不合法）——备份成
+`bot_state.db.corrupted_<时间戳>`，重建一份空 schema。这个检查在每次数据
+库连接前都会触发，不只是启动时，所以损坏可能发生在运行过程中。除了
+`last_order_id`，其他所有游标在各自的 `get_state(key, now)` 调用点都是安
+全地默认成"现在"，所以就算被重置，最多也就是"今天的东西可能重复提醒一
+次"。**唯独 `last_order_id` 默认值是 `"0"`**——所以游标一旦丢失，
+`job_new_orders` 就会把*有史以来所有*已确认订单都当成"新订单"抓出来，逐
+条推到 Slack，每条间隔 1.2 秒。HEFS 这边因此把约 808 条历史订单在 19
+分钟内刷进了大家共用的 "odoo-report" 频道，直到手动 `systemctl restart`
+才停下来（重启之所以能解决，是因为 `main()` 自己启动时的 bootstrap 逻辑
+会把 `last_order_id` 重新设成当前最大值——bug 出在
+`_check_db_file()` 的原地自愈逻辑没有做同样的事）。**两边部署都已修
+复：** `_check_db_file()` 现在会用它手头已经打开的那个连接，自己把
+`last_order_id` 重新初始化——而不是通过 `set_state()`，因为
+`set_state()` 会走 `get_conn()` → `_check_db_file()` → 同一把非可重入的
+`_check_lock`，会把整个进程死锁。以后如果再改动 `_check_db_file()`，任
+何游标修复逻辑都要用它已经打开的那个 `conn`，绝对不要在里面调用
+`set_state()`/`get_conn()`。
+
+**`app_mention` 触发不稳定**——经常连续很长时间一次都不触发，但触发的
+时候又可能对同一条消息重复投递两次（实际观测到过：一次 `expense`
+提及创建了两条 `hr.expense` 记录）。两边部署都已修复：把
+`handle_mention` 的处理逻辑挪进共用的 `_dispatch_mention()`，同时挂在
+`app_mention` 和一个 `message` 事件的兜底逻辑上（检查文本里是否含
+`<@bot_user_id>`），并加了 `(channel, ts)` 去重锁，不管到底是哪个/哪些
+事件触发、触发几次，每条真实消息只会被处理一次。
+
+**仅 LasaPop —— `<@BOTID>` 形式的提及会静默丢失：** 用户复制粘贴之前的
+消息而不是重新打 `@` 从自动补全里选，粘贴的文本可能带的是应用的
+`bot_id`（`<@BOTID>` 形式），而不是 `bot_user_id`（`<@USERID>` 形式）。
+上面那个兜底逻辑原本只检查 `bot_user_id`，所以这种消息在
+`app_mention` 和兜底逻辑里都匹配不上，悄无声息地消失，日志里连痕迹都没
+有。已修复：`_get_bot_id()` 缓存 `auth_test()` 返回的 `bot_id`，兜底逻辑
+现在两种形式都认。
+
+**通用函数 `update_status(table, row_id, status, note="")` 要求表里必须有
+`note` 列**——它无条件执行 `SET status=?, note=?, ...`。任何新接入这个函数
+的 SQLite 表（除了那四张提醒/告警表，还有 `expense_requests`）都必须有
+`note TEXT` 这一列，否则该表上的每次按钮点击都会在
+`chat_update` 还没执行到之前就静默失败（2026-08-04 修复，当时
+`invoice_reminders`/`quotation_reminders`/`stock_alerts` 缺这一列已经缺了
+很久了——同样的 bug 在 `expense_requests` 上因为还在测试阶段而被立刻抓
+到）。
+
+**LasaPop 这套 Odoo 的 XML-RPC 在调用 action 方法时会抛出一个假的
+`cannot marshal None` 错误**（`action_submit`、`action_approve` 等），
+即便底层写入其实已经成功了——`odoo/expenses.py::_safe_execute()`
+专门吞掉这个特定的错误文本。以后对这个 Odoo 实例新增任何 action 方法
+调用，都要预料到同样的现象。
+
+**`SLACK_CHANNEL_ODOO_REPORT` 是一个私有频道**——必须用频道 **ID**
+配置，不能用名称；bot 的 token 没有 `groups:read` 权限，没法自己把私有
+频道名解析成 ID。
+
+**删除 Slack 消息不会撤回已经推送到手机上的通知。** 如果刷屏消息已经推
+到了大家手机上，频道里的消息本体可以用 `chat.delete` 批量清理（需要
+`channels:history`/`groups:history` 这个 bot 权限，默认 token 没有——去
+Slack app 的 OAuth & Permissions 页面加上并重新安装到工作区；重新安装不
+一定会换新 token，跟 `.env` 里现有的比对一下就知道），但已经推送到手机
+上的通知已经从 Slack 这边发出去了，只能在手机客户端里手动清。
+
+## 常用排查命令
+
+```bash
+# 服务健康状态
+sudo systemctl status odoo-slack-bot.service        # 或 lasapop-slack-bot.service
+sudo journalctl -u odoo-slack-bot.service -f
+
+# 任务是不是卡住了？（对比 "Running job" 和下一条 "executed successfully"）
+sudo journalctl -u odoo-slack-bot.service --no-pager | grep -i job_new_orders | tail -20
+
+# 轮询游标
+sqlite3 /opt/odoo-slack-bot/bot_state.db "select * from notification_state;"
+
+# 数据库自愈机制有没有触发过？
+ls -la /opt/odoo-slack-bot/bot_state.db.corrupted_*
+```
+
+## 迁移 / 交接
+
+1. `git clone git@github.com:hefstim/odoo-slack-bot.git`（先看上面共用
+   remote 那节的提醒——清楚自己带过来的是哪个部署的本地分叉，因为全新
+   clone 出来的代码既没有 HEFS 也没有 LasaPop 各自的未提交内容）。
+2. `python3 -m venv venv && venv/bin/pip install -r requirements.txt`
+   （不要直接拷贝 `venv/`——它跟旧机器的 Python 构建版本绑定）。
+3. 把 git 不跟踪的密钥/状态从旧服务器拷过来：`.env`、
+   `google_credentials.json`、`bot_state.db`（可选——带过来能保留轮询游
+   标和同日去重状态；不带也没关系，游标首次运行会自动初始化成"现在"，
+   不会导致历史全量重放）。
+4. 拷贝 systemd unit 文件，更新其中的 `WorkingDirectory`/`ExecStart`
+   路径，然后 `systemctl daemon-reload && systemctl enable --now <服务名>`。
+5. 验证：`journalctl -u <服务名> -f`——确认能看到
+   `Odoo connection OK (uid=...)` 和 `Scheduler started`，没有报错堆栈。
+6. `SLACK_BOT_TOKEN`/`SLACK_APP_TOKEN` 在任何服务器上都能用——同一个
+   Slack app 迁移不需要在 Slack 那边重新配置。
