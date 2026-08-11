@@ -47,10 +47,53 @@ def register_handlers(app: App):
 
     # ── @mention commands ─────────────────────────────────────────────────────
 
+    # `app_mention` on this Slack app fires unreliably — sometimes not at all
+    # (historically, zero occurrences of the mention-only ack text like
+    # ":hourglass_flowing_sand: Running" across days of bot.log), sometimes
+    # redelivered twice for one real message (observed directly on the LasaPop
+    # deployment of this same codebase: two `hr.expense` records created 1.2s
+    # apart from a single `expense` mention). A `message`-event fallback is
+    # also registered below so mentions still get through when `app_mention`
+    # stays silent. Since either or both may fire for the same underlying
+    # message, every dispatch is deduplicated by (channel, ts) before doing
+    # anything with side effects (Odoo writes, scheduler jobs, Slack posts).
+    _seen_event_ids: set[str] = set()
+    _seen_event_order: list[str] = []
+    _SEEN_CAP = 500
+
+    def _already_processed(channel: str, ts: str) -> bool:
+        key = f"{channel}:{ts}"
+        if key in _seen_event_ids:
+            return True
+        _seen_event_ids.add(key)
+        _seen_event_order.append(key)
+        if len(_seen_event_order) > _SEEN_CAP:
+            oldest = _seen_event_order.pop(0)
+            _seen_event_ids.discard(oldest)
+        return False
+
     @app.event("app_mention")
     def handle_mention(body, say, client):
-        text    = body.get("event", {}).get("text", "")
-        channel = body["event"]["channel"]
+        _dispatch_mention(body.get("event", {}), say, client)
+
+    @app.event("message")
+    def handle_message_mention(body, say, client, context):
+        event = body.get("event", {})
+        if event.get("subtype") or event.get("bot_id"):
+            return  # ignore edits, deletions, and our own bot's messages
+        bot_user_id = context.get("bot_user_id", "")
+        text = event.get("text", "")
+        if not bot_user_id or f"<@{bot_user_id}>" not in text:
+            return
+        _dispatch_mention(event, say, client)
+
+    def _dispatch_mention(event, say, client):
+        if _already_processed(event.get("channel", ""), event.get("ts", "")):
+            logger.info("Skipping duplicate mention event: channel=%s ts=%s",
+                        event.get("channel"), event.get("ts"))
+            return
+        text    = event.get("text", "")
+        channel = event.get("channel", "")
 
         words   = text.split()
         keyword = words[1].strip("<>@!").rstrip(".,!?").lower() if len(words) > 1 else ""
