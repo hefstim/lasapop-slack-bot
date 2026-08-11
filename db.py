@@ -56,6 +56,7 @@ _SCHEMA = """
         slack_ts      TEXT,
         slack_channel TEXT,
         status        TEXT    DEFAULT 'pending',
+        note          TEXT,
         updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
 
@@ -72,6 +73,7 @@ _SCHEMA = """
         slack_ts      TEXT,
         slack_channel TEXT,
         status        TEXT    DEFAULT 'pending',
+        note          TEXT,
         updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
 
@@ -98,6 +100,7 @@ _SCHEMA = """
         slack_ts      TEXT,
         slack_channel TEXT,
         status        TEXT    DEFAULT 'pending',
+        note          TEXT,
         updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
 
@@ -154,6 +157,30 @@ def _check_db_file():
         conn = sqlite3.connect(DB_PATH, timeout=30)
         try:
             _create_schema(conn)
+
+            # last_order_id has no safe default — unlike the other cursors
+            # (which default to "now" at their get_state() call sites),
+            # job_new_orders defaults a missing cursor to "0", so an unset
+            # key means "replay every confirmed order ever placed" into
+            # Slack, 1.2s apart, until a process restart happens to re-run
+            # main()'s own bootstrap. Set it here too so a mid-run
+            # corruption can't trigger a multi-hour flood. Written directly
+            # via `conn` (not set_state()) because set_state() goes through
+            # get_conn() -> _check_db_file() -> _check_lock, and this whole
+            # block already holds that same non-reentrant lock.
+            try:
+                from odoo.orders import get_max_order_id
+                max_id = get_max_order_id()
+                conn.execute(
+                    "INSERT OR REPLACE INTO notification_state (key,value,updated_at) "
+                    "VALUES ('last_order_id',?,CURRENT_TIMESTAMP)",
+                    (str(max_id),)
+                )
+                conn.commit()
+                logger.info("Re-initialized order cursor at id=%d after DB recovery.", max_id)
+            except Exception:
+                logger.exception("Failed to re-initialize order cursor after DB recovery — "
+                                  "job_new_orders will replay full history until next restart.")
         finally:
             conn.close()
         os.chmod(DB_PATH, 0o600)
@@ -162,7 +189,7 @@ def _check_db_file():
             f"`bot_state.db` was corrupted and has been auto-recovered "
             f"(bad copy saved as `{backup.name}`). Polling cursors were reset — "
             f"a same-day reminder could be sent twice, and today's already-notified "
-            f"orders/payments may briefly re-fire."
+            f"payments may briefly re-fire."
         )
 
 
