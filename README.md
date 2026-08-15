@@ -230,11 +230,36 @@ that table silently fails at the `chat_update`-never-reached point (fixed
 were missing it for a long time — same bug immediately caught on
 `expense_requests` since it was still being tested).
 
-**LasaPop's Odoo XML-RPC raises spurious `cannot marshal None` on action
-methods** (`action_submit`, `action_approve`, etc.) even though the
-underlying write succeeds — `odoo/expenses.py::_safe_execute()` swallows
-that specific fault text. Expect the same on any new action-method call
-against this instance.
+**Both Odoo instances' XML-RPC raise a spurious `cannot marshal None` on
+action methods that return `None`** — `TypeError: cannot marshal None unless
+allow_none is enabled`, thrown server-side while serializing the XML-RPC
+response, **after** the underlying write has already committed. Confirmed on
+LasaPop (`action_submit`, `action_approve` on `hr.expense` —
+`odoo/expenses.py::_safe_execute()` swallows that specific fault text) and
+independently on HEFS (`stock.quant.action_apply_inventory`, while applying
+inventory-count adjustments 2026-08-15 — every one of a 42-item batch raised
+this fault, and a script that treats the exception as failure will report
+"0 applied" even though the writes went through). **Never trust a script's
+own try/except-based success/fail count for a call to one of these action
+methods — always independently re-read the record afterward to confirm the
+actual state**, the same way you would after any fire-and-forget write.
+Expect the same quirk on any new action-method call against either
+instance.
+
+**Programmatic inventory adjustments (`stock.quant`) via XML-RPC — creating
+a brand-new quant with `inventory_quantity` set inline in the `create()` call
+silently no-ops**, even though `create()` itself returns a valid id and
+raises no error. `action_apply_inventory` then runs against it but the
+on-hand `quantity` never changes. Confirmed 2026-08-15 reconciling HEFS's
+Antipolo warehouse against a physical count: 40/42 products (all of which
+already had an existing quant row) applied correctly via
+`write({'inventory_quantity': N})` + `action_apply_inventory`; the 2 products
+with no prior quant at that location (brand-new `create()`) silently stayed
+at 0 despite `inventory_quantity` being passed at creation. Fix: `create()`
+the quant with no `inventory_quantity` (or bare `{'product_id', 'location_id'}`
+only), *then* `write()` the `inventory_quantity` as a separate call, *then*
+`action_apply_inventory` — same two-step pattern as updating an existing
+quant, just with an extra `create()` in front.
 
 **`SLACK_CHANNEL_ODOO_REPORT` is a private channel** — configure it by
 channel **ID**, never name; the bot's token lacks `groups:read` and can't

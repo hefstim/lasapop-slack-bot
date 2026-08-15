@@ -221,11 +221,33 @@ instances reached (1)`）**—— 说明这个任务卡住了，不是空闲。�
 很久了——同样的 bug 在 `expense_requests` 上因为还在测试阶段而被立刻抓
 到）。
 
-**LasaPop 这套 Odoo 的 XML-RPC 在调用 action 方法时会抛出一个假的
-`cannot marshal None` 错误**（`action_submit`、`action_approve` 等），
-即便底层写入其实已经成功了——`odoo/expenses.py::_safe_execute()`
-专门吞掉这个特定的错误文本。以后对这个 Odoo 实例新增任何 action 方法
+**两套 Odoo 的 XML-RPC 在调用返回 `None` 的 action 方法时都会抛出一个假的
+`cannot marshal None` 错误**——`TypeError: cannot marshal None unless
+allow_none is enabled`，是服务端在序列化 XML-RPC 响应的时候抛出来的，
+这时候底层的写入其实**已经提交成功了**。LasaPop 这边确认过
+（`hr.expense` 的 `action_submit`、`action_approve`——
+`odoo/expenses.py::_safe_execute()` 专门吞掉这个特定的错误文本），
+HEFS 这边也独立确认过同样的现象（`stock.quant.action_apply_inventory`，
+2026-08-15 批量做库存盘点调整时——42 条里每一条调用都抛了这个错，如果
+脚本把异常当成失败来计数，会显示"0 条成功"，但实际上写入全都生效了）。
+**永远不要相信脚本自己用 try/except 统计出来的成功/失败数**——调用这类
+action 方法之后，一定要单独重新读取一次记录，确认真实状态，跟处理任何
+"发了就不管"的写入操作一样。以后对这两个 Odoo 实例新增任何 action 方法
 调用，都要预料到同样的现象。
+
+**通过 XML-RPC 做库存调整（`stock.quant`）时——新建一条从未存在过的
+quant，如果在 `create()` 调用里直接把 `inventory_quantity` 一起传进去，
+会静默不生效**，即便 `create()` 本身正常返回了一个 id、没有报任何错。
+之后再对这个新 quant 调 `action_apply_inventory`，库存的 `quantity`
+字段也不会变。2026-08-15 核对 HEFS 的 Antipolo 仓库实盘数据时确认过：
+42 个产品里，40 个原本就有 quant 记录的，用
+`write({'inventory_quantity': N})` + `action_apply_inventory` 都正确生效
+了；另外 2 个该库位之前完全没有 quant 记录、靠 `create()` 新建的，即便
+创建时就带上了 `inventory_quantity`，库存还是静默停在 0。解决办法：
+`create()` 的时候不要带 `inventory_quantity`（只传
+`{'product_id', 'location_id'}` 就行），**单独**再调一次 `write()` 设置
+`inventory_quantity`，最后再 `action_apply_inventory`——跟更新已有 quant
+的两步流程一样，只是前面多一步 `create()`。
 
 **`SLACK_CHANNEL_ODOO_REPORT` 是一个私有频道**——必须用频道 **ID**
 配置，不能用名称；bot 的 token 没有 `groups:read` 权限，没法自己把私有
