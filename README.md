@@ -274,6 +274,52 @@ reinstall to the workspace; reinstalling doesn't always rotate the token,
 diff against `.env` to check), but already-pushed phone notifications are
 gone from Slack's side and can only be cleared client-side.
 
+## Other services on this server (japan_oracle)
+
+Not part of this repo, but worth knowing about since they run on the same
+box and get confused with this project's issues:
+
+**`hermes-agent`** (NousResearch, `/usr/local/lib/hermes-agent`, third-party
+— not our code) — a separate AI agent messaging-gateway, two profiles/
+systemd services: `hermes-gateway.service` (HEFS, `@geminicloudrunbot`) and
+`hermes-gateway-lasapop.service` (LasaPop). Two bugs hit both profiles
+2026-08-19:
+
+- **Slack Socket Mode gets stuck in a non-self-healing reconnect loop.**
+  After a transport disconnect, the reconnect logic reuses an already-closed
+  `aiohttp.ClientSession` instead of creating a fresh one, so every retry
+  immediately fails with `RuntimeError: Session is closed` and it never
+  recovers on its own — `journalctl` fills up with that line every few
+  seconds, indefinitely. HEFS was stuck ~1.5 hours before being caught;
+  LasaPop had been stuck since **2026-08-10, ~9 days, 235,000+ occurrences**
+  — went unnoticed because the separate one-shot `hermes send` CLI path
+  (used by `hermes-fallback-watch.service` for alerts) doesn't depend on the
+  broken persistent socket, so outbound alerts kept working fine while
+  inbound `@mention` listening was completely dead. **Symptom:** the process
+  is `active (running)`, looks healthy in `systemctl status`, but the bot
+  never responds to anything. **Fix:** `journalctl -u <service> | grep -c
+  "Session is closed"` to confirm, then just `systemctl restart <service>`
+  — no config change needed, a fresh process gets a fresh session. No
+  permanent fix has been applied upstream; if this recurs, restart is the
+  known workaround.
+- **LasaPop's `openai-codex` credential pool has two entries that are
+  actually the same ChatGPT account**, not two separate accounts. Compare
+  HEFS's `/root/.hermes/auth.json` (`openai-codex-oauth-1` =
+  qilin0369@gmail.com, `openai-codex-oauth-2` = fengjunhua113@gmail.com —
+  genuinely different accounts, so when one hits its weekly usage limit the
+  other still has quota) against LasaPop's
+  `/root/.hermes/profiles/lasapop/auth.json`, where both pool entries
+  (`device_code` and `openai-codex-oauth-2`) decode to the identical
+  `access_token`/`refresh_token`/`chatgpt_account_id`
+  (qilin0369@gmail.com). So LasaPop has no real failover — when that one
+  account hits `usage_limit_reached`, both pool entries show `exhausted`
+  simultaneously and every request falls straight to the deepseek/openrouter
+  fallback. Fix requires re-running `hermes -p lasapop auth add openai-codex
+  --type oauth` with a *different* account's interactive device-code login
+  (can't be done non-interactively) — and per the existing "known hermes
+  bug" note above, re-check `config.yaml`'s `model:` block afterward for
+  corruption.
+
 ## Diagnostic quick-reference
 
 ```bash

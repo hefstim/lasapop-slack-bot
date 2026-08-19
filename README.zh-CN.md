@@ -260,6 +260,47 @@ Slack app 的 OAuth & Permissions 页面加上并重新安装到工作区；重�
 一定会换新 token，跟 `.env` 里现有的比对一下就知道），但已经推送到手机
 上的通知已经从 Slack 这边发出去了，只能在手机客户端里手动清。
 
+## 服务器上的其他服务（japan_oracle）
+
+不属于这个仓库，但因为跑在同一台服务器上、容易跟这个项目的问题搞混，
+值得记一下：
+
+**`hermes-agent`**（NousResearch 出品，装在 `/usr/local/lib/hermes-agent`，
+第三方代码，不是我们自己写的）——一个独立的 AI agent 消息网关，两个
+profile/systemd 服务：`hermes-gateway.service`（HEFS，
+`@geminicloudrunbot`）和 `hermes-gateway-lasapop.service`（LasaPop）。
+2026-08-19 这天两边同时踩到了两个 bug：
+
+- **Slack Socket Mode 会卡进一个不会自愈的重连死循环。** 传输层断开之后，
+  重连逻辑复用了一个已经关闭的 `aiohttp.ClientSession`，而不是新建一个，
+  所以每次重试都立刻报 `RuntimeError: Session is closed`，然后就再也没法
+  自己恢复——`journalctl` 里这一行会每隔几秒刷一次，无限刷下去。HEFS 卡了
+  大约 1.5 小时才被发现；LasaPop 从 **2026-08-10 就开始卡住，卡了差不多
+  9 天，累计报错 23.5 万多次**——之所以一直没人发现，是因为单独的一次性
+  `hermes send` 命令行路径（`hermes-fallback-watch.service` 发告警用的
+  就是这个）不依赖那个已经坏掉的常驻 socket，所以对外发告警一直正常，
+  但接收 `@mention` 消息的监听其实已经彻底死了。**症状：** 进程本身
+  `systemctl status` 显示 `active (running)`，看起来很健康，但机器人对
+  任何消息都没有反应。**处理方法：** 先用 `journalctl -u <服务名> | grep
+  -c "Session is closed"` 确认，然后直接 `systemctl restart <服务名>`
+  就行——不需要改任何配置，一个全新的进程会拿到一个全新的 session。上游
+  没有出过正式修复，以后再遇到还是重启这个临时办法。
+- **LasaPop 的 `openai-codex` 凭证池里的两个条目其实是同一个 ChatGPT
+  账号**，不是真正的两个不同账号。对比一下 HEFS 的
+  `/root/.hermes/auth.json`（`openai-codex-oauth-1` = qilin0369@gmail.com，
+  `openai-codex-oauth-2` = fengjunhua113@gmail.com——是真的两个不同账号，
+  所以一个用完周额度另一个还有）和 LasaPop 的
+  `/root/.hermes/profiles/lasapop/auth.json`，会发现里面两个凭证池条目
+  （`device_code` 和 `openai-codex-oauth-2`）解码出来的
+  `access_token`/`refresh_token`/`chatgpt_account_id` 完全一样（都是
+  qilin0369@gmail.com）。所以 LasaPop 这边根本没有真正的故障转移——那一个
+  账号一旦 `usage_limit_reached`，两个凭证池条目会同时显示
+  `exhausted`，所有请求直接落到 deepseek/openrouter 兜底。要修的话需要
+  用**另一个**账号重新走一遍 `hermes -p lasapop auth add openai-codex
+  --type oauth` 的交互式扫码登录（没法非交互式完成）——而且按前面那条
+  "hermes 已知 bug" 提到的，加完凭证之后要重新检查一下 `config.yaml` 里
+  的 `model:` 块有没有被搞坏。
+
 ## 常用排查命令
 
 ```bash
