@@ -213,8 +213,10 @@ def register_handlers(app: App):
                 return
             try:
                 amount = float(words[2])
+                if amount <= 0:
+                    raise ValueError
             except ValueError:
-                say(f"⛔ Invalid amount `{words[2]}`. Usage: `@lasapop_bot expense <amount> <description>`")
+                say(f"⛔ Invalid amount `{words[2]}`. Must be a positive number.")
                 return
             description = " ".join(words[3:])
             try:
@@ -232,6 +234,7 @@ def register_handlers(app: App):
             threading.Thread(
                 target=_submit_and_post_expense,
                 args=(client, employee_id, employee_name, amount, description, image_files, say),
+                kwargs={"submitter_id": submitter_id},
                 daemon=True,
             ).start()
             return
@@ -252,8 +255,10 @@ def register_handlers(app: App):
                 return
             try:
                 amount = float(words[2])
+                if amount <= 0:
+                    raise ValueError
             except ValueError:
-                say(f"⛔ Invalid amount `{words[2]}`. Usage: `@lasapop_bot cashin <amount> <note>`")
+                say(f"⛔ Invalid amount `{words[2]}`. Must be a positive number.")
                 return
             note = " ".join(words[3:])
             _record_cash_topup(amount, note, submitter_id, say)
@@ -487,6 +492,7 @@ def register_handlers(app: App):
         threading.Thread(
             target=_submit_and_post_expense,
             args=(client, employee_id, employee_name, amount, description, receipt_files, _notify),
+            kwargs={"submitter_id": user_id},
             daemon=True,
         ).start()
 
@@ -561,11 +567,13 @@ def register_handlers(app: App):
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
-def _submit_and_post_expense(client, employee_id, employee_name, amount, description, raw_files, notify):
+def _submit_and_post_expense(client, employee_id, employee_name, amount, description, raw_files, notify, submitter_id=""):
     """Shared by the `expense` @mention command and the `submit_expense`
     shortcut modal. `raw_files` items just need a `url_private` (or an `id`
     to resolve one via files_info) and optionally a `name`. `notify(text)`
-    delivers the final result back to whichever surface triggered this."""
+    delivers the final result back to whichever surface triggered this.
+    `submitter_id` is the Slack user id of whoever submitted, kept for the
+    audit trail and so approval can later check against self-approval."""
     try:
         from odoo.expenses import create_and_submit_expense, attach_receipt
         expense_id = create_and_submit_expense(employee_id, amount, description)
@@ -593,7 +601,7 @@ def _submit_and_post_expense(client, employee_id, employee_name, amount, descrip
             except Exception as e:
                 logger.error("Failed to attach receipt for expense %s: %s", expense_id, e)
 
-        row_id = db.save_expense_request(expense_id, employee_name, amount, description, "", "", "")
+        row_id = db.save_expense_request(expense_id, employee_name, amount, description, submitter_id, "", "")
         resp = client.chat_postMessage(
             channel=Config.SLACK_CHANNEL_EXPENSE_APPROVAL,
             blocks=build_expense_approval_blocks(
@@ -781,3 +789,18 @@ def _update_expense(body: dict, client, action: str):
         )
     except Exception as e:
         logger.error("Failed to update Slack message: %s", e)
+
+    # An approval just increased all-time spend — warn if it pushed the
+    # factory cash balance negative so an admin knows to top it up.
+    if action == "approved":
+        try:
+            from odoo.expenses import get_all_time_approved_total
+            balance = db.get_total_topups() - get_all_time_approved_total()["total"]
+            if balance < 0:
+                client.chat_postMessage(
+                    channel=Config.SLACK_CHANNEL_EXPENSE_APPROVAL,
+                    text=f":rotating_light: Factory cash balance is now *negative* (₱{balance:,.2f}) "
+                         f"after approving this expense. Please record a cash top-up (`cashin`).",
+                )
+        except Exception as e:
+            logger.error("Failed to check cash balance after approval: %s", e)
