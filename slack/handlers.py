@@ -3,6 +3,7 @@ import logging
 import threading
 from slack_bolt import App
 from config import Config
+from slack.messages import build_expense_approval_blocks
 import db
 
 logger = logging.getLogger(__name__)
@@ -27,19 +28,15 @@ COMMANDS = {
 
 HELP_TEXT = (
     "*Available commands — mention me with any of these:*\n\n"
-    "`@OdooBot report` — Daily sales report\n"
-    "`@OdooBot weekly` — Weekly sales report\n"
-    "`@OdooBot monthly` — Last month's completed report\n"
-    "`@OdooBot monthly 2025-11` — Report for a specific month\n"
-    "`@OdooBot thismonth` — Current month progress report\n"
-    "`@OdooBot dormant` — Export dormant customers to Google Sheet\n"
-    "`@OdooBot invoices` — Overdue invoice check\n"
-    "`@OdooBot invoicesheet` — Export overdue invoices (≤30 days) to Google Sheet for follow-up\n"
-    "`@OdooBot legacy` — Export invoices overdue >30 days to Google Sheet for manual review\n"
-    "`@OdooBot quotations` — Pending quotation follow-up\n"
-    "`@OdooBot stock` — Low stock alert\n"
-    "`@OdooBot contactsync` — Sync Customer Contact Info sheet → Odoo\n"
-    "`@OdooBot help` — Show this help message"
+    "`@lasapop_bot expense <amount> <description>` — Submit an expense for approval (attach a receipt photo if you have one)\n"
+    "`@lasapop_bot expensetotal` — This month's approved cash expense total + current cash balance\n"
+    "`@lasapop_bot cashin <amount> <note>` — Record a cash top-up into the factory cash fund (admin only)\n"
+    "`@lasapop_bot balance` — Current factory cash balance (top-ups minus approved expenses)\n"
+    "`@lasapop_bot help` — Show this help message\n\n"
+    "*Or click the ⚡ shortcuts icon next to the message box:*\n"
+    "  • *提交支出* — same as `expense`, as a form (supports receipt upload)\n"
+    "  • *查询现金统计* — same as `expensetotal`/`balance`, sent to you as a DM\n"
+    "  • *充值现金* — same as `cashin`, as a form (admin only)"
 )
 
 
@@ -128,7 +125,7 @@ def register_handlers(app: App):
             say(HELP_TEXT)
             return
 
-        # ── Monthly report with specific month: @OdooBot monthly 2025-11 ──────
+        # ── Monthly report with specific month: @lasapop_bot monthly 2025-11 ──────
         if keyword in ("monthly", "thismonth") and month_arg:
             try:
                 from datetime import datetime as _dt
@@ -204,8 +201,71 @@ def register_handlers(app: App):
             threading.Thread(target=_run_contactsync, daemon=True).start()
             return
 
+        # ── expense: submit an expense report for approval ────────────────────
+        if keyword == "expense":
+            submitter_id = event.get("user", "")
+            employee_id = Config.EXPENSE_EMPLOYEE_MAP.get(submitter_id)
+            if not employee_id:
+                say("⛔ You're not registered as an employee for expense submission. Contact an admin.")
+                return
+            if len(words) < 4:
+                say("Usage: `@lasapop_bot expense <amount> <description>` — e.g. `@lasapop_bot expense 500 taxi fare`")
+                return
+            try:
+                amount = float(words[2])
+            except ValueError:
+                say(f"⛔ Invalid amount `{words[2]}`. Usage: `@lasapop_bot expense <amount> <description>`")
+                return
+            description = " ".join(words[3:])
+            try:
+                employee_name = client.users_info(user=submitter_id)["user"]["real_name"]
+            except Exception:
+                employee_name = submitter_id
+
+            # Receipt photo is optional — attach whichever images were shared
+            # alongside the mention, if any. No receipt is a valid submission.
+            image_files = [
+                f for f in event.get("files", [])
+                if (f.get("mimetype") or "").startswith("image/")
+            ]
+
+            threading.Thread(
+                target=_submit_and_post_expense,
+                args=(client, employee_id, employee_name, amount, description, image_files, say),
+                daemon=True,
+            ).start()
+            return
+
+        # ── expensetotal: this month's approved cash expense summary ──────────
+        if keyword == "expensetotal":
+            threading.Thread(target=_report_cash_stats, args=(say,), daemon=True).start()
+            return
+
+        # ── cashin: record a cash top-up into the factory cash fund (admin only) ──
+        if keyword == "cashin":
+            submitter_id = event.get("user", "")
+            if submitter_id not in Config.ADMIN_USER_IDS:
+                say("⛔ Only an admin can record a cash top-up.")
+                return
+            if len(words) < 3:
+                say("Usage: `@lasapop_bot cashin <amount> <note>` — e.g. `@lasapop_bot cashin 50000 monthly withdrawal`")
+                return
+            try:
+                amount = float(words[2])
+            except ValueError:
+                say(f"⛔ Invalid amount `{words[2]}`. Usage: `@lasapop_bot cashin <amount> <note>`")
+                return
+            note = " ".join(words[3:])
+            _record_cash_topup(amount, note, submitter_id, say)
+            return
+
+        # ── balance: current factory cash balance ──────────────────────────────
+        if keyword == "balance":
+            threading.Thread(target=_report_balance, args=(say,), daemon=True).start()
+            return
+
         if keyword not in COMMANDS:
-            say(f"Unknown command `{keyword}`. Type `@OdooBot help` to see available commands.")
+            say(f"Unknown command `{keyword}`. Type `@lasapop_bot help` to see available commands.")
             return
 
         label, job_fn_name = COMMANDS[keyword]
@@ -326,8 +386,278 @@ def register_handlers(app: App):
         ack()
         _update_generic(body, client, "stock_alerts", "ignored", "⏭ 已忽略")
 
+    # ── Expense actions ────────────────────────────────────────────────────────
+
+    @app.action("expense_approved")
+    def handle_expense_approved(ack, body, client):
+        ack()
+        _update_expense(body, client, "approved")
+
+    @app.action("expense_refused")
+    def handle_expense_refused(ack, body, client):
+        ack()
+        _update_expense(body, client, "refused")
+
+    # ── Expense submission shortcut (⚡ shortcuts icon → 提交支出) ──────────────
+    # Alternative to the `expense` @mention command — a form instead of typing
+    # a fixed-format command, and sidesteps the mention-format issues that
+    # plagued the @mention path (copy-pasted <@BOTID> mentions, flaky event
+    # delivery — see project notes). Uses views_open/view_submission, a
+    # separate Slack dispatch mechanism from message/app_mention events.
+    @app.shortcut("submit_expense")
+    def handle_submit_expense_shortcut(ack, body, client):
+        ack()
+        user_id = body["user"]["id"]
+        if user_id not in Config.EXPENSE_EMPLOYEE_MAP:
+            client.chat_postMessage(
+                channel=user_id,
+                text="⛔ You're not registered as an employee for expense submission. Contact an admin.",
+            )
+            return
+        client.views_open(
+            trigger_id=body["trigger_id"],
+            view={
+                "type": "modal",
+                "callback_id": "expense_modal",
+                "title": {"type": "plain_text", "text": "提交支出"},
+                "submit": {"type": "plain_text", "text": "提交"},
+                "close": {"type": "plain_text", "text": "取消"},
+                "blocks": [
+                    {
+                        "type": "input",
+                        "block_id": "amount_block",
+                        "label": {"type": "plain_text", "text": "金额 (₱)"},
+                        "element": {"type": "plain_text_input", "action_id": "amount_input"},
+                    },
+                    {
+                        "type": "input",
+                        "block_id": "desc_block",
+                        "label": {"type": "plain_text", "text": "描述"},
+                        "element": {"type": "plain_text_input", "action_id": "desc_input"},
+                    },
+                    {
+                        "type": "input",
+                        "block_id": "receipt_block",
+                        "optional": True,
+                        "label": {"type": "plain_text", "text": "收据（可选）"},
+                        "element": {
+                            "type": "file_input",
+                            "action_id": "receipt_input",
+                            "filetypes": ["png", "jpg", "jpeg", "pdf"],
+                            "max_files": 1,
+                        },
+                    },
+                ],
+            },
+        )
+
+    @app.view("expense_modal")
+    def handle_expense_modal_submission(ack, body, client, view):
+        user_id = body["user"]["id"]
+        values = view["state"]["values"]
+        amount_raw = values["amount_block"]["amount_input"]["value"].strip()
+        description = values["desc_block"]["desc_input"]["value"].strip()
+        try:
+            amount = float(amount_raw)
+            if amount <= 0:
+                raise ValueError
+        except ValueError:
+            ack(response_action="errors", errors={"amount_block": "请输入有效金额"})
+            return
+        ack()
+
+        employee_id = Config.EXPENSE_EMPLOYEE_MAP.get(user_id)
+        if not employee_id:
+            client.chat_postMessage(
+                channel=user_id,
+                text="⛔ You're not registered as an employee for expense submission. Contact an admin.",
+            )
+            return
+
+        receipt_files = (values.get("receipt_block") or {}).get("receipt_input", {}).get("files") or []
+
+        def _notify(text):
+            client.chat_postMessage(channel=Config.SLACK_CHANNEL_EXPENSE_APPROVAL, text=text)
+
+        try:
+            employee_name = client.users_info(user=user_id)["user"]["real_name"]
+        except Exception:
+            employee_name = user_id
+
+        threading.Thread(
+            target=_submit_and_post_expense,
+            args=(client, employee_id, employee_name, amount, description, receipt_files, _notify),
+            daemon=True,
+        ).start()
+
+    # ── Cash stats shortcut (⚡ shortcuts icon → 查询现金统计) ─────────────────
+    # Read-only — same info as `expensetotal`, DMed to whoever clicked it.
+    @app.shortcut("query_cash_stats")
+    def handle_query_cash_stats_shortcut(ack, body, client):
+        ack()
+        threading.Thread(
+            target=_report_cash_stats,
+            args=(lambda text: client.chat_postMessage(channel=Config.SLACK_CHANNEL_EXPENSE_APPROVAL, text=text),),
+            daemon=True,
+        ).start()
+
+    # ── Cash top-up shortcut (⚡ shortcuts icon → 充值现金, admin only) ────────
+    @app.shortcut("cashin_shortcut")
+    def handle_cashin_shortcut(ack, body, client):
+        ack()
+        user_id = body["user"]["id"]
+        if user_id not in Config.ADMIN_USER_IDS:
+            client.chat_postMessage(channel=user_id, text="⛔ Only an admin can record a cash top-up.")
+            return
+        client.views_open(
+            trigger_id=body["trigger_id"],
+            view={
+                "type": "modal",
+                "callback_id": "cashin_modal",
+                "title": {"type": "plain_text", "text": "充值现金"},
+                "submit": {"type": "plain_text", "text": "提交"},
+                "close": {"type": "plain_text", "text": "取消"},
+                "blocks": [
+                    {
+                        "type": "input",
+                        "block_id": "amount_block",
+                        "label": {"type": "plain_text", "text": "金额 (₱)"},
+                        "element": {"type": "plain_text_input", "action_id": "amount_input"},
+                    },
+                    {
+                        "type": "input",
+                        "block_id": "note_block",
+                        "optional": True,
+                        "label": {"type": "plain_text", "text": "备注"},
+                        "element": {"type": "plain_text_input", "action_id": "note_input"},
+                    },
+                ],
+            },
+        )
+
+    @app.view("cashin_modal")
+    def handle_cashin_modal_submission(ack, body, client, view):
+        user_id = body["user"]["id"]
+        if user_id not in Config.ADMIN_USER_IDS:
+            ack()
+            client.chat_postMessage(channel=user_id, text="⛔ Only an admin can record a cash top-up.")
+            return
+        values = view["state"]["values"]
+        amount_raw = values["amount_block"]["amount_input"]["value"].strip()
+        note = ((values.get("note_block") or {}).get("note_input", {}).get("value") or "").strip()
+        try:
+            amount = float(amount_raw)
+            if amount <= 0:
+                raise ValueError
+        except ValueError:
+            ack(response_action="errors", errors={"amount_block": "请输入有效金额"})
+            return
+        ack()
+        _record_cash_topup(
+            amount, note, user_id,
+            lambda text: client.chat_postMessage(channel=Config.SLACK_CHANNEL_EXPENSE_APPROVAL, text=text),
+        )
+
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
+
+def _submit_and_post_expense(client, employee_id, employee_name, amount, description, raw_files, notify):
+    """Shared by the `expense` @mention command and the `submit_expense`
+    shortcut modal. `raw_files` items just need a `url_private` (or an `id`
+    to resolve one via files_info) and optionally a `name`. `notify(text)`
+    delivers the final result back to whichever surface triggered this."""
+    try:
+        from odoo.expenses import create_and_submit_expense, attach_receipt
+        expense_id = create_and_submit_expense(employee_id, amount, description)
+
+        attached = 0
+        for f in raw_files:
+            try:
+                url = f.get("url_private")
+                name = f.get("name", "receipt.jpg")
+                if not url and f.get("id"):
+                    info = client.files_info(file=f["id"])["file"]
+                    url = info.get("url_private")
+                    name = info.get("name", name)
+                if not url:
+                    continue
+                import requests
+                resp_file = requests.get(
+                    url,
+                    headers={"Authorization": f"Bearer {Config.SLACK_BOT_TOKEN}"},
+                    timeout=15,
+                )
+                resp_file.raise_for_status()
+                attach_receipt(expense_id, name, resp_file.content)
+                attached += 1
+            except Exception as e:
+                logger.error("Failed to attach receipt for expense %s: %s", expense_id, e)
+
+        row_id = db.save_expense_request(expense_id, employee_name, amount, description, "", "", "")
+        resp = client.chat_postMessage(
+            channel=Config.SLACK_CHANNEL_EXPENSE_APPROVAL,
+            blocks=build_expense_approval_blocks(
+                {"employee_name": employee_name, "amount": amount, "description": description},
+                row_id,
+            ),
+            text=f"Expense approval request: {description} ({amount})",
+        )
+        db.set_expense_slack_message(row_id, resp["ts"], resp["channel"])
+        receipt_note = f" ({attached} receipt photo(s) attached)" if attached else ""
+        notify(f":white_check_mark: Expense submitted for approval (₱{amount:,.2f} — {description}){receipt_note}.")
+    except Exception as e:
+        logger.error("expense submission failed: %s", e)
+        notify(f":x: Failed to submit expense: {e}")
+
+
+def _report_cash_stats(notify):
+    """Shared by `expensetotal` (@mention) and the `query_cash_stats` shortcut."""
+    try:
+        from datetime import date as _date
+        from odoo.expenses import get_month_expense_summary, get_all_time_approved_total
+        today = _date.today()
+        summary = get_month_expense_summary(today.year, today.month)
+        lines = [
+            f":receipt: *{today.strftime('%B %Y')} approved cash expenses* — "
+            f"*₱{summary['total']:,.2f}* ({summary['count']} item(s))"
+        ]
+        for name, amount in sorted(summary["by_employee"].items(), key=lambda x: -x[1]):
+            lines.append(f"  • {name}: ₱{amount:,.2f}")
+
+        topups = db.get_total_topups()
+        all_time_spent = get_all_time_approved_total()["total"]
+        lines.append(f"\n:money_with_wings: *Current factory cash balance: ₱{topups - all_time_spent:,.2f}*")
+
+        notify("\n".join(lines))
+    except Exception as e:
+        logger.error("expensetotal failed: %s", e)
+        notify(f":x: Failed to fetch expense total: {e}")
+
+
+def _report_balance(notify):
+    """Shared by `balance` (@mention) — the shortcut path reuses `_report_cash_stats` instead
+    since it already includes the balance line."""
+    try:
+        from odoo.expenses import get_all_time_approved_total
+        topups = db.get_total_topups()
+        spent = get_all_time_approved_total()["total"]
+        balance = topups - spent
+        notify(
+            f":money_with_wings: *Factory cash balance*\n"
+            f"  • Total top-ups: ₱{topups:,.2f}\n"
+            f"  • Total approved expenses: ₱{spent:,.2f}\n"
+            f"  • *Current balance: ₱{balance:,.2f}*"
+        )
+    except Exception as e:
+        logger.error("balance failed: %s", e)
+        notify(f":x: Failed to compute balance: {e}")
+
+
+def _record_cash_topup(amount, note, submitted_by, notify):
+    """Shared by `cashin` (@mention) and the `cashin_shortcut` modal."""
+    db.save_cash_topup(amount, note, submitted_by)
+    notify(f":moneybag: Recorded cash top-up of ₱{amount:,.2f}{' — ' + note if note else ''}.")
+
 
 def _get_actor(body: dict) -> str:
     user = body.get("user", {})
@@ -379,6 +709,67 @@ def _update_generic(body: dict, client, table: str, status: str, label: str):
                 break
 
     new_text = f"~{record_name}~ — {label}  _(by {actor})_"
+    try:
+        client.chat_update(
+            channel=body["channel"]["id"],
+            ts=body["message"]["ts"],
+            blocks=[
+                {"type": "section", "text": {"type": "mrkdwn", "text": new_text}}
+            ],
+            text=new_text,
+        )
+    except Exception as e:
+        logger.error("Failed to update Slack message: %s", e)
+
+
+def _update_expense(body: dict, client, action: str):
+    user_id = body.get("user", {}).get("id", "")
+    if user_id not in Config.ADMIN_USER_IDS:
+        client.chat_postEphemeral(
+            channel=body["channel"]["id"],
+            user=user_id,
+            text="⛔ Only an admin can approve or refuse expenses.",
+        )
+        return
+
+    row_id = int(body["actions"][0]["value"])
+    actor = _get_actor(body)
+    row = db.get_row("expense_requests", row_id)
+    if not row:
+        return
+
+    # Atomically claim the row before touching Odoo — closes the race where a
+    # double-click, a redelivered button event, or two admins on the same card
+    # could otherwise both pass a check and both call the Odoo action.
+    if not db.claim_expense_request(row_id, action):
+        client.chat_postEphemeral(
+            channel=body["channel"]["id"],
+            user=user_id,
+            text=f"This expense was already {row['status']} — no action taken.",
+        )
+        return
+
+    try:
+        from odoo.expenses import approve_expense, refuse_expense
+        if action == "approved":
+            approve_expense(row["odoo_expense_id"])
+        else:
+            refuse_expense(row["odoo_expense_id"], f"Refused via Slack by {actor}")
+    except Exception as e:
+        logger.error("Failed to %s expense %s in Odoo: %s", action, row["odoo_expense_id"], e)
+        # Odoo call failed after we already claimed the row locally — release
+        # the claim so a retry (re-click) is possible instead of being stuck
+        # showing "already <status>" for a request Odoo never actually applied.
+        db.update_status("expense_requests", row_id, "pending")
+        client.chat_postEphemeral(
+            channel=body["channel"]["id"],
+            user=user_id,
+            text=f"⛔ Odoo update failed: {e}",
+        )
+        return
+
+    label = "✅ Approved" if action == "approved" else "❌ Refused"
+    new_text = f"~{row['employee_name']} — {row['description']} (₱{row['amount']:,.2f})~ — {label}  _(by {actor})_"
     try:
         client.chat_update(
             channel=body["channel"]["id"],

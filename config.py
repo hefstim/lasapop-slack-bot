@@ -26,6 +26,8 @@ class Config:
     SLACK_CHANNEL_CASH = os.getenv("SLACK_CHANNEL_CASH", "")
     # 线上支付凭证上传频道（只读，统计图片数量）
     SLACK_CHANNEL_PAYMENT_PROOFS = os.getenv("SLACK_CHANNEL_PAYMENT_PROOFS", "C0ARCDELSAJ")
+    # 报销审批卡片发布频道
+    SLACK_CHANNEL_EXPENSE_APPROVAL = os.getenv("SLACK_CHANNEL_EXPENSE_APPROVAL", "")
 
     # Business Rules
     DORMANT_CUSTOMER_DAYS = int(os.getenv("DORMANT_CUSTOMER_DAYS", "90"))
@@ -59,3 +61,13 @@ class Config:
             if "=" in pair:
                 name, uid = pair.split("=", 1)
                 SALESPERSON_MAP[name.strip()] = uid.strip()
+
+    # Slack user ID -> Odoo hr.employee id, for the `expense` mention command
+    _RAW_EXPENSE_MAP = os.getenv("EXPENSE_EMPLOYEE_MAP", "")
+    EXPENSE_EMPLOYEE_MAP: dict[str, int] = {}
+    if _RAW_EXPENSE_MAP:
+        for pair in _RAW_EXPENSE_MAP.split(","):
+            pair = pair.strip()
+            if "=" in pair:
+                slack_uid, employee_id = pair.split("=", 1)
+                EXPENSE_EMPLOYEE_MAP[slack_uid.strip()] = int(employee_id.strip())

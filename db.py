@@ -15,7 +15,7 @@ from config import Config
 _BASE = Path(__file__).parent
 DB_PATH = str(_BASE / "bot_state.db")
 BACKUP_DIR = _BASE / "backups"
-BACKUP_KEEP = 6
+BACKUP_KEEP = 96  # 15-min interval x 96 = 24h of rolling snapshots
 
 _SQLITE_MAGIC = b"SQLite format 3\x00"
 logger = logging.getLogger(__name__)
@@ -107,6 +107,28 @@ _SCHEMA = """
     CREATE TABLE IF NOT EXISTS integrity_alerted_orders (
         order_id   INTEGER PRIMARY KEY,
         alerted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS expense_requests (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        odoo_expense_id INTEGER NOT NULL,
+        employee_name TEXT    NOT NULL,
+        amount        REAL    NOT NULL,
+        description   TEXT,
+        submitted_by_slack_id TEXT,
+        slack_ts      TEXT,
+        slack_channel TEXT,
+        status        TEXT    DEFAULT 'pending',
+        note          TEXT,
+        updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS cash_topups (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        amount        REAL    NOT NULL,
+        note          TEXT,
+        submitted_by_slack_id TEXT,
+        created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
 """
 
@@ -310,6 +332,59 @@ def save_stock_alert(product_id, product_name, qty_on_hand, reorder_point, slack
             (product_id, product_name, qty_on_hand, reorder_point, today, slack_ts, channel)
         )
         return cur.lastrowid
+
+
+def save_expense_request(odoo_expense_id, employee_name, amount, description,
+                          submitted_by_slack_id, slack_ts, channel) -> int:
+    with get_conn() as conn:
+        cur = conn.execute(
+            """INSERT INTO expense_requests
+               (odoo_expense_id,employee_name,amount,description,
+                submitted_by_slack_id,slack_ts,slack_channel)
+               VALUES (?,?,?,?,?,?,?)""",
+            (odoo_expense_id, employee_name, amount, description,
+             submitted_by_slack_id, slack_ts, channel)
+        )
+        return cur.lastrowid
+
+
+def set_expense_slack_message(row_id: int, slack_ts: str, channel: str):
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE expense_requests SET slack_ts=?, slack_channel=? WHERE id=?",
+            (slack_ts, channel, row_id),
+        )
+
+
+def claim_expense_request(row_id: int, status: str) -> bool:
+    """Atomically move a pending expense request to `status`. Returns False
+    (no-op) if it wasn't still 'pending' — guards a double-click, redelivered
+    button event, or two admins racing the same card from calling the Odoo
+    approve/refuse action twice."""
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE expense_requests SET status=?, updated_at=CURRENT_TIMESTAMP "
+            "WHERE id=? AND status='pending'",
+            (status, row_id),
+        )
+        return cur.rowcount > 0
+
+
+# ── Cash top-ups (factory petty cash fund) ────────────────────────────────────
+
+def save_cash_topup(amount: float, note: str, submitted_by_slack_id: str) -> int:
+    with get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO cash_topups (amount, note, submitted_by_slack_id) VALUES (?,?,?)",
+            (amount, note, submitted_by_slack_id),
+        )
+        return cur.lastrowid
+
+
+def get_total_topups() -> float:
+    with get_conn() as conn:
+        row = conn.execute("SELECT COALESCE(SUM(amount), 0) AS total FROM cash_topups").fetchone()
+    return row["total"]
 
 
 def update_status(table: str, row_id: int, status: str, note: str = ""):

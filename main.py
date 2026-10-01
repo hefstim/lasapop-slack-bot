@@ -28,7 +28,7 @@ from scheduler.jobs import (
     job_integrity_check,
     job_new_customer_contact_check,
 )
-from scheduler.cash_jobs import job_cash_balance_verify, job_online_payment_digest
+from scheduler.cash_jobs import job_online_payment_digest
 from odoo.orders import get_max_order_id
 from odoo.payments import now_utc_str
 
@@ -52,15 +52,15 @@ def build_scheduler() -> BackgroundScheduler:
     # Every 5 min, 08:00–19:55 only — nobody's watching Slack at night, so these
     # real-time pollers stand down 20:00–08:00. Cursor-based, so whatever came in
     # overnight is caught up in one batch the moment 08:00 hits — nothing is lost.
-    scheduler.add_job(job_new_orders, CronTrigger(hour="8-19", minute="*/5", timezone=tz), id="new_orders")
-    scheduler.add_job(job_new_payments, CronTrigger(hour="8-19", minute="*/5", timezone=tz), id="new_payments")
-    scheduler.add_job(job_new_customer_contact_check, CronTrigger(hour="8-19", minute="*/5", timezone=tz), id="new_customer_contact_check")
+    # [停用-未运营] scheduler.add_job(job_new_orders, CronTrigger(hour="8-19", minute="*/5", timezone=tz), id="new_orders")
+    # [停用-未运营] scheduler.add_job(job_new_payments, CronTrigger(hour="8-19", minute="*/5", timezone=tz), id="new_payments")
+    # [停用-未运营] scheduler.add_job(job_new_customer_contact_check, CronTrigger(hour="8-19", minute="*/5", timezone=tz), id="new_customer_contact_check")
 
     # Every 4 hours — check if excluded customers have reactivated
-    scheduler.add_job(job_reactivation_check, "interval", hours=4, id="reactivation_check")
+    # [停用-未运营] scheduler.add_job(job_reactivation_check, "interval", hours=4, id="reactivation_check")
 
     # Every 2 hours — sync Won't Buy from Google Sheet to blacklist
-    scheduler.add_job(job_sync_wont_buy, "interval", hours=2, id="sync_wont_buy")
+    # [停用-未运营] scheduler.add_job(job_sync_wont_buy, "interval", hours=2, id="sync_wont_buy")
 
     # Every 1 hour — data integrity check (zero/negative invoices, date logic
     # errors, payment_state mismatches, possible duplicate invoices, orders
@@ -68,41 +68,40 @@ def build_scheduler() -> BackgroundScheduler:
     scheduler.add_job(job_integrity_check, "interval", hours=1, id="integrity_check")
 
     # 08:00 — low stock alert (warehouse needs early warning)
-    scheduler.add_job(job_low_stock, CronTrigger(hour=8, minute=0, timezone=tz), id="low_stock")
+    # [停用-未运营] scheduler.add_job(job_low_stock, CronTrigger(hour=8, minute=0, timezone=tz), id="low_stock")
 
     # 09:00 — dormant customer reminders
-    scheduler.add_job(job_dormant_customers, CronTrigger(hour=9, minute=0, timezone=tz), id="dormant_customers")
+    # [停用-未运营] scheduler.add_job(job_dormant_customers, CronTrigger(hour=9, minute=0, timezone=tz), id="dormant_customers")
 
     # 09:30 — overdue invoices
-    scheduler.add_job(job_overdue_invoices, CronTrigger(hour=9, minute=30, timezone=tz), id="overdue_invoices")
+    # [停用-未运营] scheduler.add_job(job_overdue_invoices, CronTrigger(hour=9, minute=30, timezone=tz), id="overdue_invoices")
 
     # 09:35 — overdue invoices follow-up sheet (employees track progress)
-    scheduler.add_job(job_export_overdue_invoices, CronTrigger(hour=9, minute=35, timezone=tz), id="export_overdue_invoices")
+    # [停用-未运营] scheduler.add_job(job_export_overdue_invoices, CronTrigger(hour=9, minute=35, timezone=tz), id="export_overdue_invoices")
 
     # 10:00 — pending quotations
-    scheduler.add_job(job_pending_quotations, CronTrigger(hour=10, minute=0, timezone=tz), id="pending_quotations")
+    # [停用-未运营] scheduler.add_job(job_pending_quotations, CronTrigger(hour=10, minute=0, timezone=tz), id="pending_quotations")
 
     # 18:00 — daily sales report (end of business day)
-    scheduler.add_job(job_daily_report, CronTrigger(hour=18, minute=0, timezone=tz), id="daily_report")
+    # [停用-未运营] scheduler.add_job(job_daily_report, CronTrigger(hour=18, minute=0, timezone=tz), id="daily_report")
 
     # Monday 08:30 — weekly report for last week
-    scheduler.add_job(job_weekly_report, CronTrigger(day_of_week="mon", hour=8, minute=30, timezone=tz), id="weekly_report")
+    # [停用-未运营] scheduler.add_job(job_weekly_report, CronTrigger(day_of_week="mon", hour=8, minute=30, timezone=tz), id="weekly_report")
 
     # Monday 09:45 — refresh legacy overdue invoice review sheet (>30 days, not daily noise)
-    scheduler.add_job(job_export_legacy_invoices, CronTrigger(day_of_week="mon", hour=9, minute=45, timezone=tz), id="legacy_invoices")
+    # [停用-未运营] scheduler.add_job(job_export_legacy_invoices, CronTrigger(day_of_week="mon", hour=9, minute=45, timezone=tz), id="legacy_invoices")
 
     # 1st of each month 09:00 — monthly report for last month
-    scheduler.add_job(job_monthly_report, CronTrigger(day=1, hour=9, minute=0, timezone=tz), id="monthly_report")
+    # [停用-未运营] scheduler.add_job(job_monthly_report, CronTrigger(day=1, hour=9, minute=0, timezone=tz), id="monthly_report")
 
     # 18:30 — online payment digest (Odoo payments + proof image count from Slack)
-    scheduler.add_job(job_online_payment_digest, CronTrigger(hour=18, minute=30, timezone=tz), id="online_payment_digest")
+    # [停用-未运营] scheduler.add_job(job_online_payment_digest, CronTrigger(hour=18, minute=30, timezone=tz), id="online_payment_digest")
 
     # 19:00 — cash balance verification (Odoo cash income vs Google Sheet records)
-    scheduler.add_job(job_cash_balance_verify, CronTrigger(hour=19, minute=0, timezone=tz), id="cash_balance_verify")
 
     # Every 1 hour — hot backup of bot_state.db (last 6 kept), so a future
     # corruption event doesn't wipe out all polling cursors / dedup state
-    scheduler.add_job(db.backup_db, "interval", hours=1, id="backup_state_db")
+    scheduler.add_job(db.backup_db, "interval", minutes=15, id="backup_state_db")
 
     return scheduler
 

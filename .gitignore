@@ -7,3 +7,4 @@ __pycache__/
 *.pyc
 bot_state.db.corrupted_*
 backups/
+.env.bak-*

@@ -177,6 +177,46 @@ def build_invoice_blocks(invoice: dict, db_row_id: int) -> list:
     ]
 
 
+# ── Expense Approval ──────────────────────────────────────────────────────────
+
+def build_expense_approval_blocks(expense: dict, db_row_id: int) -> list:
+    return [
+        {
+            "type": "header",
+            "text": {"type": "plain_text", "text": "🧾 Expense Approval Request", "emoji": True},
+        },
+        {"type": "divider"},
+        {
+            "type": "section",
+            "fields": [
+                {"type": "mrkdwn", "text": f"*Employee*\n{expense['employee_name']}"},
+                {"type": "mrkdwn", "text": f"*Amount*\n*{fmt_money(expense['amount'])}*"},
+                {"type": "mrkdwn", "text": f"*Description*\n{expense['description']}"},
+            ],
+        },
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "✅ Approve", "emoji": True},
+                    "style": "primary",
+                    "action_id": "expense_approved",
+                    "value": str(db_row_id),
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "❌ Refuse", "emoji": True},
+                    "style": "danger",
+                    "action_id": "expense_refused",
+                    "value": str(db_row_id),
+                },
+            ],
+        },
+        {"type": "divider"},
+    ]
+
+
 # ── Quotation Follow-up ───────────────────────────────────────────────────────
 
 def build_quotation_blocks(quote: dict, db_row_id: int) -> list:
