@@ -1,26 +1,10 @@
 """Expense (hr.expense) creation and approval workflow."""
 import base64
-import xmlrpc.client
 from datetime import date
 
 from odoo.client import get_client
 
 DEFAULT_PRODUCT_ID = 6  # "Expenses" (generic/miscellaneous) category
-
-
-def _safe_execute(model: str, method: str, *args, **kwargs):
-    """Call an Odoo action method that returns None (e.g. action_submit,
-    action_approve). This Odoo instance's XML-RPC layer raises a spurious
-    'cannot marshal None' Fault for such calls even though the underlying
-    write succeeds — swallow only that specific fault.
-    """
-    client = get_client()
-    try:
-        return client.execute(model, method, *args, **kwargs)
-    except xmlrpc.client.Fault as e:
-        if "cannot marshal None" in str(e):
-            return None
-        raise
 
 
 def create_and_submit_expense(employee_id: int, amount: float, description: str,
@@ -36,12 +20,12 @@ def create_and_submit_expense(employee_id: int, amount: float, description: str,
         "payment_mode": payment_mode,
         "date": date.today().isoformat(),
     })
-    _safe_execute("hr.expense", "action_submit", [expense_id])
+    client.execute("hr.expense", "action_submit", [expense_id])
     return expense_id
 
 
 def approve_expense(expense_id: int):
-    _safe_execute("hr.expense", "action_approve", [expense_id])
+    get_client().execute("hr.expense", "action_approve", [expense_id])
 
 
 def refuse_expense(expense_id: int, reason: str):
@@ -52,7 +36,7 @@ def refuse_expense(expense_id: int, reason: str):
         "reason": reason,
         "expense_ids": [(6, 0, [expense_id])],
     })
-    _safe_execute("hr.expense.refuse.wizard", "action_refuse", [wizard_id])
+    client.execute("hr.expense.refuse.wizard", "action_refuse", [wizard_id])
 
 
 def attach_receipt(expense_id: int, filename: str, file_bytes: bytes) -> int:

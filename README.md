@@ -3,7 +3,7 @@
 > [中文版](README.zh-CN.md)
 
 One codebase, two independent live deployments — HEFS (Philippines) and
-LasaPop. Both bridge Odoo (XML-RPC) with Slack: poll Odoo on a schedule, post
+LasaPop. Both bridge Odoo (JSON-2 API) with Slack: poll Odoo on a schedule, post
 notification/interactive cards, let staff act with one click, export to
 Google Sheets. Each deployment is its own systemd service, own `.env`, own
 `bot_state.db`, and has drifted from the other in features — **but both
@@ -31,7 +31,8 @@ config.py                All configuration, read from .env
 db.py                    SQLite (bot_state.db) — polling cursors, reminder/dedup state,
                           DB-corruption self-heal (see "Known issues" below)
 odoo/
-  client.py              XML-RPC wrapper. Auto-retries once on a broken persistent connection.
+  client.py              Odoo client on the JSON-2 API (bearer API key). Read calls retry once on a transport error.
+  json2.py               Minimal stdlib JSON-2 client; execute_kw() keeps the XML-RPC calling shape.
   orders.py / payments.py / invoices.py / quotations.py / inventory.py
   customers.py / reports.py / integrity.py
   expenses.py             LasaPop only — hr.expense submit/approve/refuse via Odoo
@@ -230,6 +231,9 @@ that table silently fails at the `chat_update`-never-reached point (fixed
 were missing it for a long time — same bug immediately caught on
 `expense_requests` since it was still being tested).
 
+**Resolved 2026-10-17 by moving to the JSON-2 API** — methods that return `None` now simply return
+`null`, and `_safe_execute()` was removed. Historical note, kept because the re-read advice still applies:
+
 **Both Odoo instances' XML-RPC raise a spurious `cannot marshal None` on
 action methods that return `None`** — `TypeError: cannot marshal None unless
 allow_none is enabled`, thrown server-side while serializing the XML-RPC
@@ -246,7 +250,7 @@ actual state**, the same way you would after any fire-and-forget write.
 Expect the same quirk on any new action-method call against either
 instance.
 
-**Programmatic inventory adjustments (`stock.quant`) via XML-RPC — creating
+**Programmatic inventory adjustments (`stock.quant`) via the API — creating
 a brand-new quant with `inventory_quantity` set inline in the `create()` call
 silently no-ops**, even though `create()` itself returns a valid id and
 raises no error. `action_apply_inventory` then runs against it but the

@@ -2,7 +2,7 @@
 
 > [English version](README.md)
 
-一套代码，两个独立运行的实际部署——HEFS（菲律宾）和 LasaPop。两边都是把 Odoo（XML-RPC）和 Slack 打通：定时轮询 Odoo、往 Slack 推通知/交互卡片、让员工一键操作、导出数据到 Google Sheets。每个部署有自己独立的 systemd 服务、独立的 `.env`、独立的 `bot_state.db`，功能上也已经互相分叉——**但两个目录是同一个 GitHub 仓库的 git checkout**，做任何 git 操作前务必先看下面"⚠️ 共用 git remote"那一节。
+一套代码，两个独立运行的实际部署——HEFS（菲律宾）和 LasaPop。两边都是把 Odoo（JSON-2 API）和 Slack 打通：定时轮询 Odoo、往 Slack 推通知/交互卡片、让员工一键操作、导出数据到 Google Sheets。每个部署有自己独立的 systemd 服务、独立的 `.env`、独立的 `bot_state.db`，功能上也已经互相分叉——**但两个目录是同一个 GitHub 仓库的 git checkout**，做任何 git 操作前务必先看下面"⚠️ 共用 git remote"那一节。
 
 | | HEFS | LasaPop |
 |---|---|---|
@@ -25,7 +25,8 @@ config.py                所有配置，从 .env 读取
 db.py                    SQLite（bot_state.db）—— 轮询游标、提醒/去重状态、
                           数据库损坏自愈逻辑（见下方"已知问题"）
 odoo/
-  client.py              XML-RPC 封装。持久连接断开时自动重连重试一次。
+  client.py              基于 JSON-2 API 的 Odoo 客户端（bearer API key）。读操作遇网络错误重试一次。
+  json2.py               仅用标准库的 JSON-2 客户端；execute_kw() 保持 XML-RPC 的调用写法。
   orders.py / payments.py / invoices.py / quotations.py / inventory.py
   customers.py / reports.py / integrity.py
   expenses.py             仅 LasaPop —— 通过 Odoo 提交/审批/拒绝 hr.expense
@@ -221,6 +222,9 @@ instances reached (1)`）**—— 说明这个任务卡住了，不是空闲。�
 很久了——同样的 bug 在 `expense_requests` 上因为还在测试阶段而被立刻抓
 到）。
 
+**2026-10-17 改用 JSON-2 API 后已解决**——返回 `None` 的方法现在正常返回 `null`，`_safe_execute()` 已删除。
+以下为历史记录，保留是因为“写入后单独回读确认”的建议仍然适用：
+
 **两套 Odoo 的 XML-RPC 在调用返回 `None` 的 action 方法时都会抛出一个假的
 `cannot marshal None` 错误**——`TypeError: cannot marshal None unless
 allow_none is enabled`，是服务端在序列化 XML-RPC 响应的时候抛出来的，
@@ -235,7 +239,7 @@ action 方法之后，一定要单独重新读取一次记录，确认真实状�
 "发了就不管"的写入操作一样。以后对这两个 Odoo 实例新增任何 action 方法
 调用，都要预料到同样的现象。
 
-**通过 XML-RPC 做库存调整（`stock.quant`）时——新建一条从未存在过的
+**通过 API 做库存调整（`stock.quant`）时——新建一条从未存在过的
 quant，如果在 `create()` 调用里直接把 `inventory_quantity` 一起传进去，
 会静默不生效**，即便 `create()` 本身正常返回了一个 id、没有报任何错。
 之后再对这个新 quant 调 `action_apply_inventory`，库存的 `quantity`

@@ -1,49 +1,41 @@
-"""Thin wrapper around Odoo XML-RPC API."""
-import http.client
-import xmlrpc.client
+"""Thin wrapper around the Odoo 19 JSON-2 API."""
 from config import Config
+from odoo.json2 import OdooError, OdooJson2
+
+# Safe to retry after a transport failure: they cannot have changed anything.
+_READ_METHODS = {"search_read", "search", "search_count", "read", "read_group", "fields_get"}
 
 
 class OdooClient:
     def __init__(self):
         self.url = Config.ODOO_URL.rstrip("/")
         self.db = Config.ODOO_DB
-        self.username = Config.ODOO_USERNAME
-        self.password = Config.ODOO_PASSWORD
+        self._odoo = OdooJson2(self.url, self.db, Config.ODOO_API_KEY)
         self._uid = None
-        self._connect()
-
-    def _connect(self):
-        self._common = xmlrpc.client.ServerProxy(f"{self.url}/xmlrpc/2/common")
-        self._models = xmlrpc.client.ServerProxy(f"{self.url}/xmlrpc/2/object")
 
     @property
     def uid(self) -> int:
         if self._uid is None:
-            self._uid = self._common.authenticate(self.db, self.username, self.password, {})
-            if not self._uid:
-                raise ConnectionError("Odoo authentication failed. Check credentials.")
+            try:
+                self._uid = self._odoo.uid()
+            except OdooError as e:
+                if e.status == 401:
+                    raise ConnectionError("Odoo authentication failed. Check ODOO_API_KEY.") from e
+                raise
         return self._uid
 
     def execute(self, model: str, method: str, *args, **kwargs):
-        """Run an XML-RPC call, retrying once on a broken persistent connection.
+        """Call a model method with XML-RPC style positional args.
 
-        ServerProxy caches its socket for the process lifetime, so once it
-        times out or the server drops it mid-request (surfaces as
-        http.client errors like "Request-sent" or "Idle"), every later call
-        keeps failing the same way until the connection is recreated.
+        Each call is a separate stateless HTTP request (thread-safe). Read
+        methods are retried once on a transport error such as an Odoo restart.
         """
         try:
-            return self._models.execute_kw(
-                self.db, self.uid, self.password,
-                model, method, list(args), kwargs
-            )
-        except (http.client.HTTPException, OSError):
-            self._connect()
-            return self._models.execute_kw(
-                self.db, self.uid, self.password,
-                model, method, list(args), kwargs
-            )
+            return self._odoo.execute_kw(model, method, list(args), kwargs)
+        except OdooError as e:
+            if e.status is None and method in _READ_METHODS:
+                return self._odoo.execute_kw(model, method, list(args), kwargs)
+            raise
 
     def search_read(self, model: str, domain: list, fields: list,
                     limit: int = 0, order: str = "") -> list:
@@ -59,8 +51,7 @@ class OdooClient:
 
     def ping(self) -> bool:
         try:
-            version = self._common.version()
-            return bool(version)
+            return bool(self.uid)
         except Exception:
             return False
 
