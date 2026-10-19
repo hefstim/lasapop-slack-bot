@@ -61,6 +61,13 @@ class Config:
                 name, uid = pair.split("=", 1)
                 SALESPERSON_MAP[name.strip()] = uid.strip()
 
+    # Petty cash: expenses are company-paid from the petty cash journal and posted
+    # on approval; the balance is read from Odoo. Top-ups are booked by the AI
+    # assistant (record_petty_cash_topup), not here. Off = the original flow
+    # (approved expenses never posted, balance computed from local top-ups).
+    PETTY_CASH_ENABLED = os.getenv("PETTY_CASH_ENABLED", "false").lower() in ("1", "true", "yes")
+    PETTY_CASH_ACCOUNT = os.getenv("PETTY_CASH_ACCOUNT", "101101")  # Cash - PHP
+
     # Slack user ID -> Odoo hr.employee id, for the `expense` mention command
     _RAW_EXPENSE_MAP = os.getenv("EXPENSE_EMPLOYEE_MAP", "")
     EXPENSE_EMPLOYEE_MAP: dict[str, int] = {}

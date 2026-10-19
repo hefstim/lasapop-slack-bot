@@ -10,7 +10,7 @@
 | systemd 服务 | `odoo-slack-bot.service` | `lasapop-slack-bot.service` |
 | Slack 身份 | `@odoobot`，HEFS 工作区 | `@lasapop_bot`，LasaPop 工作区 |
 | Odoo | `https://www.02ph.com`，db 见 `.env` | `http://localhost:8069`，db 名 `lasapop` |
-| 运营状态 | 完全在线——真实的订单/付款/发票流水 | **业务尚未正式运营**——`main.py` 里大部分 Odoo 同步任务都被禁用（见下文），目前只有 Slack 原生的报销/现金功能是活的 |
+| 运营状态 | 完全在线——真实的订单/付款/发票流水 | **业务尚未正式运营**——`main.py` 里大部分 Odoo 同步任务都被禁用（见下文）；报销审批与备用金（2026-10-19 起报销从备用金入账）在用 |
 
 ## 共享架构
 
@@ -29,7 +29,7 @@ odoo/
   json2.py               仅用标准库的 JSON-2 客户端；execute_kw() 保持 XML-RPC 的调用写法。
   orders.py / payments.py / invoices.py / quotations.py / inventory.py
   customers.py / reports.py / integrity.py
-  expenses.py             仅 LasaPop —— 通过 Odoo 提交/审批/拒绝 hr.expense
+  expenses.py             仅 LasaPop —— hr.expense 提交/审批/拒绝、重复确认、备用金类别/入账/余额
 scheduler/
   jobs.py                 每个定时任务一个函数 —— 定时任务调用 Slack
                            chat.postMessage 的唯一入口
@@ -57,7 +57,7 @@ google_sheets/
 | `customer_reminders`、`invoice_reminders`、`quotation_reminders`、`stock_alerts` | 每条提醒卡片一行 —— 支撑交互按钮 + 同日去重 |
 | `excluded_customers` | "不再购买"黑名单 |
 | `integrity_alerted_orders` | 30 天未开票检查已经提醒过的订单 |
-| `expense_requests`、`cash_topups` | 仅 LasaPop —— 报销审批 + 现金基金记录 |
+| `expense_requests`、`cash_topups` | 仅 LasaPop —— 报销审批（含卡片位置）+ 现金充值记录（备用金开启后不再写入，余额以 Odoo 为准） |
 
 滚动备份存在 `backups/` 目录，HEFS 每小时一份，LasaPop 每 15 分钟一份。
 
@@ -107,36 +107,47 @@ LasaPop 的业务目前还没有真实订单流水跑进 Odoo（2026-08-11 确�
 `add_job()` 调用把它接入调度器**（连注释掉的痕迹都没有，就是从没加进去
 过）。已经造好了，但还没上线。
 
-### 真正在跑的：报销审批 + 现金记录（Slack 原生，不依赖 Odoo 订单）
+### 真正在跑的：报销审批 + 备用金（Slack 原生，不依赖 Odoo 订单）
 
-`@mention` 命令：`expense <金额> <说明>`、`expensetotal`、
-`cashin <金额> <备注>`（仅管理员，见 `Config.ADMIN_USER_IDS`）、
-`balance`、`help`。同样的操作也能通过 Slack shortcut（⚡ 图标）触发：
-*提交支出*、*查询现金统计*、*充值现金*。
+> **2026-10-19 更新：** 报销改为从工厂备用金逐笔入账（`PETTY_CASH_ENABLED=true`），备用金充值改由 AI
+> 助手记录。此前"不进入正式记账、每月整笔记账"的设计已废止。员工 / 管理层手册见
+> GitHub `hefstim/hermes-odoo` 的 `docs/manuals/`，Odoo 侧设置见同仓库 `docs/petty-cash/`。
 
-流程：`expense` 提及 → 创建并提交一条草稿 `hr.expense`
-（`odoo/expenses.py::create_and_submit_expense`）→ 把审批卡片发到
-`SLACK_CHANNEL_EXPENSE_APPROVAL`（`#exp-approval`）→ 管理员点 Approve/
-Refuse → 调用 `approve_expense`/`refuse_expense`（拒绝走的是
-`hr.expense.refuse.wizard`；直接在 `hr.expense` 记录上调用
-`action_refuse()` 只会弹出一个 UI 对话框，并不会真的拒绝）→ 更新本地
-`expense_requests` 那一行，原地编辑 Slack 消息。提及消息里如果附带了图片
-会被当作报销凭证下载下来，存成 `ir.attachment`
-（`attach_receipt`）——凭证上传失败只会记日志，不会阻塞报销本身的提交。
+`@mention` 命令：`expense <金额> <说明>`、`expensetotal`、`cashin <金额> <备注>`（仅管理员，
+见 `Config.ADMIN_USER_IDS`）、`balance`、`help`。同样的操作也能通过 Slack shortcut（⚡ 图标）触发：
+*提交支出*、*查询现金统计*（结果发在 `#exp-approval`，不是私信）、*充值现金*。
 
-`Config.EXPENSE_EMPLOYEE_MAP`（`.env` 里 `Slack用户ID=Odoo员工ID` 的键值
-对）是 Slack 到 Odoo 员工身份映射的唯一来源；提交人不在这个映射表里会被
-友好地拒绝，不会报错崩溃。
+**提交：** `expense` 提及或 *提交支出* 表单 → `odoo/expenses.py::create_and_submit_expense` 创建并提交
+`hr.expense` → 审批卡片发到 `SLACK_CHANNEL_EXPENSE_APPROVAL`（`#exp-approval`）。附带的图片作为凭证存成
+`ir.attachment`（`attach_receipt`），上传失败只记日志，不阻塞提交。`Config.EXPENSE_EMPLOYEE_MAP`（`.env` 里
+`Slack用户ID=Odoo员工ID`）是 Slack 到 Odoo 员工身份映射的唯一来源；不在表里的提交人会被友好拒绝。
 
-这个功能故意不接入正式的 Odoo 财务记账（不走现金日记账，不调用
-`action_post`/`action_pay`）。真正的记账方式是每月从银行取一笔现金，
-通过另一个完全独立的、AI 对话驱动的 MCP 工具
-（`/root/.hermes/odoo_mcp_lasapop.py` 里的 `record_expense`，用的是完全
-不同的 Odoo 模型）把这一整笔提现记一次账。这个功能里停在 `approved`
-状态（从未 posted/paid）的 `hr.expense` 记录，本身**就是**这笔钱具体花
-到哪里去的明细账本。除非用户实际需求变了，否则不要建议把这个功能"打通"
-到正式财务记账里——那样只会跟现有的整笔记账方式重复/冲突，解决不了任何
-问题。
+**审批：** 管理员点 Approve/Refuse → `slack/handlers.py::_update_expense`（先原子地 claim 本地
+`expense_requests` 行，防双击）→ `approve_expense` / `refuse_expense`（拒绝走
+`hr.expense.refuse.wizard`；直接调 `action_refuse()` 只会弹 UI 对话框）。
+
+- **可能重复的报销：** 同一员工、同一天、同金额时，Odoo 的 `action_approve` **不报错**，而是返回
+  `hr.expense.approve.duplicate` 向导，报销仍停在 submitted。2026-10-19 之前机器人把这种情况当成功，
+  卡片显示 Approved 而 Odoo 没批（报销 12、17，已手工补批）。现在 `approve_expense` 抛
+  `DuplicateExpenseError`，`_ask_duplicate_confirmation` 私下给审批人发提示和
+  "Not a duplicate — approve / Cancel" 两个按钮（`expense_approve_duplicate` / `expense_duplicate_cancel`）；
+  确认后经向导只批准这一笔。最后一定回读 Odoo 状态，不符就报错并释放 claim，允许重试。
+- **没有报销审批人的员工**（`hr.employee.expense_manager_id` 为空）提交即被 Odoo 自动批准，并跳过重复检查
+  （`hr.expense._can_be_autovalidated`）。新员工务必设置审批人；2026-10-19 已为 Wei Liu 设为 hellolee120。
+
+**备用金（`Config.PETTY_CASH_ENABLED`，2026-10-19 起为 true）：**
+
+| | 开关打开 | 开关关闭（旧流程） |
+|---|---|---|
+| 报销付款方式 | `company_account`，从 Odoo 账簿 `PCSH 工厂备用金` 支付 | `own_account`（员工垫付） |
+| 类别 | 表单必选；卡片上有下拉框（block `expense_category` / action `expense_category_select`），**未选不能批准**；`set_expense_category` 写入产品 | 统一用默认产品 |
+| 批准后 | `action_post` → 状态 paid，分录 借 类别科目 / 贷 101101 | 停在 approved，不入账 |
+| `balance` / 统计 | `get_petty_cash_balance()`：Odoo 101101 已过账余额；`expensetotal` 加按类别汇总 | 本地 `cash_topups` − 已批准合计 |
+| `cashin` / *充值现金* | 不记账，只提示改用 AI 助手（`record_petty_cash_topup`） | 写入本地 `cash_topups` |
+
+类别在 `odoo/expenses.py::EXPENSE_CATEGORIES`，按 Odoo 产品的内部参考 `EXP-*` 查找；各类别对应的科目
+（运费 614000 … 设备 151100、装修 151200 为固定资产）在 Odoo 产品上设置，由 `petty_cash_setup.py` 创建。
+期初余额 MISC/2026/10/0023（借 101101 / 贷 600000 PHP 31,868）。关闭开关即恢复旧流程，不需改代码。
 
 ## ⚠️ 共用 git remote —— 做任何 git 操作前先看这里
 

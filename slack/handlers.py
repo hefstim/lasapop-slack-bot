@@ -403,6 +403,24 @@ def register_handlers(app: App):
         ack()
         _update_expense(body, client, "refused")
 
+    # Buttons on the ephemeral "possible duplicate" prompt (see _ask_duplicate_confirmation).
+    @app.action("expense_approve_duplicate")
+    def handle_expense_approve_duplicate(ack, body, client, respond):
+        ack()
+        respond(delete_original=True)
+        _update_expense(body, client, "approved", confirm_duplicate=True)
+
+    @app.action("expense_duplicate_cancel")
+    def handle_expense_duplicate_cancel(ack, respond):
+        ack()
+        respond(delete_original=True)
+
+    # Category dropdown on the approval card: nothing to do on change — the
+    # Approve handler reads the selection from the message state.
+    @app.action("expense_category_select")
+    def handle_expense_category_select(ack):
+        ack()
+
     # ── Expense submission shortcut (⚡ shortcuts icon → 提交支出) ──────────────
     # Alternative to the `expense` @mention command — a form instead of typing
     # a fixed-format command, and sidesteps the mention-format issues that
@@ -419,6 +437,21 @@ def register_handlers(app: App):
                 text="⛔ You're not registered as an employee for expense submission. Contact an admin.",
             )
             return
+        category_blocks = []
+        if Config.PETTY_CASH_ENABLED:
+            from odoo.expenses import EXPENSE_CATEGORIES
+            category_blocks = [{
+                "type": "input",
+                "block_id": "category_block",
+                "label": {"type": "plain_text", "text": "类别 / Category"},
+                "element": {
+                    "type": "static_select",
+                    "action_id": "category_input",
+                    "placeholder": {"type": "plain_text", "text": "选择类别"},
+                    "options": [{"text": {"type": "plain_text", "text": label}, "value": code}
+                                for code, label in EXPENSE_CATEGORIES],
+                },
+            }]
         client.views_open(
             trigger_id=body["trigger_id"],
             view={
@@ -434,6 +467,7 @@ def register_handlers(app: App):
                         "label": {"type": "plain_text", "text": "金额 (₱)"},
                         "element": {"type": "plain_text_input", "action_id": "amount_input"},
                     },
+                    *category_blocks,
                     {
                         "type": "input",
                         "block_id": "desc_block",
@@ -480,6 +514,8 @@ def register_handlers(app: App):
             return
 
         receipt_files = (values.get("receipt_block") or {}).get("receipt_input", {}).get("files") or []
+        category_code = (((values.get("category_block") or {}).get("category_input") or {})
+                         .get("selected_option") or {}).get("value", "")
 
         def _notify(text):
             client.chat_postMessage(channel=Config.SLACK_CHANNEL_EXPENSE_APPROVAL, text=text)
@@ -492,7 +528,7 @@ def register_handlers(app: App):
         threading.Thread(
             target=_submit_and_post_expense,
             args=(client, employee_id, employee_name, amount, description, receipt_files, _notify),
-            kwargs={"submitter_id": user_id},
+            kwargs={"submitter_id": user_id, "category_code": category_code},
             daemon=True,
         ).start()
 
@@ -567,16 +603,19 @@ def register_handlers(app: App):
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
-def _submit_and_post_expense(client, employee_id, employee_name, amount, description, raw_files, notify, submitter_id=""):
+def _submit_and_post_expense(client, employee_id, employee_name, amount, description, raw_files, notify,
+                             submitter_id="", category_code=""):
     """Shared by the `expense` @mention command and the `submit_expense`
     shortcut modal. `raw_files` items just need a `url_private` (or an `id`
     to resolve one via files_info) and optionally a `name`. `notify(text)`
     delivers the final result back to whichever surface triggered this.
     `submitter_id` is the Slack user id of whoever submitted, kept for the
-    audit trail and so approval can later check against self-approval."""
+    audit trail and so approval can later check against self-approval.
+    `category_code` (petty cash only) pre-selects the category on the card;
+    the @mention command has none, so the approver picks it."""
     try:
         from odoo.expenses import create_and_submit_expense, attach_receipt
-        expense_id = create_and_submit_expense(employee_id, amount, description)
+        expense_id = create_and_submit_expense(employee_id, amount, description, category_code=category_code)
 
         attached = 0
         for f in raw_files:
@@ -605,7 +644,8 @@ def _submit_and_post_expense(client, employee_id, employee_name, amount, descrip
         resp = client.chat_postMessage(
             channel=Config.SLACK_CHANNEL_EXPENSE_APPROVAL,
             blocks=build_expense_approval_blocks(
-                {"employee_name": employee_name, "amount": amount, "description": description},
+                {"employee_name": employee_name, "amount": amount, "description": description,
+                 "category_code": category_code},
                 row_id,
             ),
             text=f"Expense approval request: {description} ({amount})",
@@ -622,7 +662,7 @@ def _report_cash_stats(notify):
     """Shared by `expensetotal` (@mention) and the `query_cash_stats` shortcut."""
     try:
         from datetime import date as _date
-        from odoo.expenses import get_month_expense_summary, get_all_time_approved_total
+        from odoo.expenses import get_month_expense_summary
         today = _date.today()
         summary = get_month_expense_summary(today.year, today.month)
         lines = [
@@ -632,9 +672,11 @@ def _report_cash_stats(notify):
         for name, amount in sorted(summary["by_employee"].items(), key=lambda x: -x[1]):
             lines.append(f"  • {name}: ₱{amount:,.2f}")
 
-        topups = db.get_total_topups()
-        all_time_spent = get_all_time_approved_total()["total"]
-        lines.append(f"\n:money_with_wings: *Current factory cash balance: ₱{topups - all_time_spent:,.2f}*")
+        if Config.PETTY_CASH_ENABLED:
+            lines.append("\n*By category:*")
+            for name, amount in sorted(summary["by_category"].items(), key=lambda x: -x[1]):
+                lines.append(f"  • {name}: ₱{amount:,.2f}")
+        lines.append(f"\n:money_with_wings: *Current factory cash balance: ₱{_cash_balance():,.2f}*")
 
         notify("\n".join(lines))
     except Exception as e:
@@ -646,6 +688,13 @@ def _report_balance(notify):
     """Shared by `balance` (@mention) — the shortcut path reuses `_report_cash_stats` instead
     since it already includes the balance line."""
     try:
+        if Config.PETTY_CASH_ENABLED:
+            notify(
+                f":money_with_wings: *Factory petty cash balance (Odoo, account {Config.PETTY_CASH_ACCOUNT})*\n"
+                f"  • *Current balance: ₱{_cash_balance():,.2f}*\n"
+                f"  _Should equal the cash counted in the box._"
+            )
+            return
         from odoo.expenses import get_all_time_approved_total
         topups = db.get_total_topups()
         spent = get_all_time_approved_total()["total"]
@@ -661,8 +710,24 @@ def _report_balance(notify):
         notify(f":x: Failed to compute balance: {e}")
 
 
+def _cash_balance() -> float:
+    """Factory cash balance: the petty cash account in Odoo, or (petty cash off)
+    local top-ups minus approved expenses."""
+    from odoo.expenses import get_all_time_approved_total, get_petty_cash_balance
+    if Config.PETTY_CASH_ENABLED:
+        return get_petty_cash_balance()
+    return db.get_total_topups() - get_all_time_approved_total()["total"]
+
+
 def _record_cash_topup(amount, note, submitted_by, notify):
-    """Shared by `cashin` (@mention) and the `cashin_shortcut` modal."""
+    """Shared by `cashin` (@mention) and the `cashin_shortcut` modal. With petty
+    cash on, top-ups are booked only through the AI assistant (bank -> cash
+    entry plus the 支出记录 ledger row), so nothing is recorded here."""
+    if Config.PETTY_CASH_ENABLED:
+        notify(":information_source: 备用金充值请通过 AI 助手记录（例如：“从银行取现 ₱"
+               f"{amount:,.0f} 放备用金”），这里没有记录。/ Record petty cash top-ups with the AI assistant; "
+               "nothing was recorded here.")
+        return
     db.save_cash_topup(amount, note, submitted_by)
     notify(f":moneybag: Recorded cash top-up of ₱{amount:,.2f}{' — ' + note if note else ''}.")
 
@@ -730,7 +795,7 @@ def _update_generic(body: dict, client, table: str, status: str, label: str):
         logger.error("Failed to update Slack message: %s", e)
 
 
-def _update_expense(body: dict, client, action: str):
+def _update_expense(body: dict, client, action: str, confirm_duplicate: bool = False):
     user_id = body.get("user", {}).get("id", "")
     if user_id not in Config.ADMIN_USER_IDS:
         client.chat_postEphemeral(
@@ -746,6 +811,21 @@ def _update_expense(body: dict, client, action: str):
     if not row:
         return
 
+    # Petty cash: the expense is booked to its category's account, so the approver
+    # must pick one on the card. A confirm from the duplicate prompt has no card
+    # state; the category was already written on the first click.
+    category_code = ""
+    if Config.PETTY_CASH_ENABLED and action == "approved" and not confirm_duplicate:
+        category_code = ((((body.get("state") or {}).get("values") or {}).get("expense_category") or {})
+                         .get("expense_category_select", {}).get("selected_option") or {}).get("value", "")
+        if not category_code:
+            client.chat_postEphemeral(
+                channel=body["channel"]["id"],
+                user=user_id,
+                text="⛔ Choose a category on the card first. / 请先在卡片上选择类别。",
+            )
+            return
+
     # Atomically claim the row before touching Odoo — closes the race where a
     # double-click, a redelivered button event, or two admins on the same card
     # could otherwise both pass a check and both call the Odoo action.
@@ -757,12 +837,21 @@ def _update_expense(body: dict, client, action: str):
         )
         return
 
+    from odoo.expenses import (CATEGORY_LABELS, DuplicateExpenseError, approve_expense, refuse_expense,
+                               set_expense_category)
     try:
-        from odoo.expenses import approve_expense, refuse_expense
         if action == "approved":
-            approve_expense(row["odoo_expense_id"])
+            if category_code:
+                set_expense_category(row["odoo_expense_id"], category_code)
+            approve_expense(row["odoo_expense_id"], confirm_duplicate=confirm_duplicate)
         else:
             refuse_expense(row["odoo_expense_id"], f"Refused via Slack by {actor}")
+    except DuplicateExpenseError as e:
+        # Not an error: Odoo wants confirmation. Leave the card pending and ask
+        # the approver privately.
+        db.update_status("expense_requests", row_id, "pending")
+        _ask_duplicate_confirmation(body, client, row, e.duplicates)
+        return
     except Exception as e:
         logger.error("Failed to %s expense %s in Odoo: %s", action, row["odoo_expense_id"], e)
         # Odoo call failed after we already claimed the row locally — release
@@ -777,11 +866,15 @@ def _update_expense(body: dict, client, action: str):
         return
 
     label = "✅ Approved" if action == "approved" else "❌ Refused"
+    if category_code:
+        label += f" · {CATEGORY_LABELS.get(category_code, category_code)}"
     new_text = f"~{row['employee_name']} — {row['description']} (₱{row['amount']:,.2f})~ — {label}  _(by {actor})_"
     try:
+        # The stored card location also covers clicks from the ephemeral
+        # duplicate prompt, whose payload carries no "message".
         client.chat_update(
-            channel=body["channel"]["id"],
-            ts=body["message"]["ts"],
+            channel=row["slack_channel"] or body["channel"]["id"],
+            ts=row["slack_ts"] or body["message"]["ts"],
             blocks=[
                 {"type": "section", "text": {"type": "mrkdwn", "text": new_text}}
             ],
@@ -794,8 +887,7 @@ def _update_expense(body: dict, client, action: str):
     # factory cash balance negative so an admin knows to top it up.
     if action == "approved":
         try:
-            from odoo.expenses import get_all_time_approved_total
-            balance = db.get_total_topups() - get_all_time_approved_total()["total"]
+            balance = _cash_balance()
             if balance < 0:
                 client.chat_postMessage(
                     channel=Config.SLACK_CHANNEL_EXPENSE_APPROVAL,
@@ -804,3 +896,32 @@ def _update_expense(body: dict, client, action: str):
                 )
         except Exception as e:
             logger.error("Failed to check cash balance after approval: %s", e)
+
+
+def _ask_duplicate_confirmation(body: dict, client, row, duplicates: list):
+    """Privately ask the approver to confirm an expense Odoo thinks may be a duplicate."""
+    lines = "\n".join(
+        f"• {d['date']} — {d['name']} (₱{d['total_amount']:,.2f}, {d['state']})" for d in duplicates
+    ) or "• (Odoo did not say which one)"
+    text = (
+        f":warning: *Possible duplicate — not approved yet* / 可能是重复报销，尚未批准\n"
+        f"*{row['employee_name']} — {row['description']} (₱{row['amount']:,.2f})* has the same "
+        f"employee, date and amount as:\n{lines}\n"
+        f"Check the receipts. If it is a different expense, approve it below; "
+        f"if it is a duplicate, press Refuse on the original card."
+    )
+    client.chat_postEphemeral(
+        channel=body["channel"]["id"],
+        user=body["user"]["id"],
+        text=text,
+        blocks=[
+            {"type": "section", "text": {"type": "mrkdwn", "text": text}},
+            {"type": "actions", "elements": [
+                {"type": "button", "style": "primary", "action_id": "expense_approve_duplicate",
+                 "value": str(row["id"]),
+                 "text": {"type": "plain_text", "text": "Not a duplicate — approve / 确认批准"}},
+                {"type": "button", "action_id": "expense_duplicate_cancel", "value": str(row["id"]),
+                 "text": {"type": "plain_text", "text": "Cancel / 取消"}},
+            ]},
+        ],
+    )

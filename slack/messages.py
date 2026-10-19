@@ -180,6 +180,22 @@ def build_invoice_blocks(invoice: dict, db_row_id: int) -> list:
 # ── Expense Approval ──────────────────────────────────────────────────────────
 
 def build_expense_approval_blocks(expense: dict, db_row_id: int) -> list:
+    category_blocks = []
+    if Config.PETTY_CASH_ENABLED:
+        # The approver confirms or picks the category here; the Approve handler
+        # reads it from the message state (block_id/action_id below).
+        from odoo.expenses import EXPENSE_CATEGORIES
+        options = [{"text": {"type": "plain_text", "text": label}, "value": code}
+                   for code, label in EXPENSE_CATEGORIES]
+        select = {"type": "static_select", "action_id": "expense_category_select",
+                  "placeholder": {"type": "plain_text", "text": "选择类别 / Choose category"},
+                  "options": options}
+        initial = [o for o in options if o["value"] == expense.get("category_code")]
+        if initial:
+            select["initial_option"] = initial[0]
+        category_blocks = [{"type": "section", "block_id": "expense_category",
+                            "text": {"type": "mrkdwn", "text": "*Category / 类别*"},
+                            "accessory": select}]
     return [
         {
             "type": "header",
@@ -194,6 +210,7 @@ def build_expense_approval_blocks(expense: dict, db_row_id: int) -> list:
                 {"type": "mrkdwn", "text": f"*Description*\n{expense['description']}"},
             ],
         },
+        *category_blocks,
         {
             "type": "actions",
             "elements": [

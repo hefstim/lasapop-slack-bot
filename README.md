@@ -16,7 +16,7 @@ directories are git checkouts of the exact same GitHub repo**, see
 | systemd service | `odoo-slack-bot.service` | `lasapop-slack-bot.service` |
 | Slack identity | `@odoobot`, workspace HEFS | `@lasapop_bot`, workspace LasaPop |
 | Odoo | `https://www.02ph.com`, db from `.env` | `http://localhost:8069`, db `lasapop` |
-| Operational status | Fully live — real order/payment/invoice volume | **Business not yet operational** — most Odoo-sync jobs are disabled in `main.py` (see below); only the Slack-native expense/cash features are live |
+| Operational status | Fully live — real order/payment/invoice volume | **Business not yet operational** — most Odoo-sync jobs are disabled in `main.py` (see below); expense approval and petty cash are live (expenses posted from petty cash since 2026-10-19) |
 
 ## Shared architecture
 
@@ -35,7 +35,7 @@ odoo/
   json2.py               Minimal stdlib JSON-2 client; execute_kw() keeps the XML-RPC calling shape.
   orders.py / payments.py / invoices.py / quotations.py / inventory.py
   customers.py / reports.py / integrity.py
-  expenses.py             LasaPop only — hr.expense submit/approve/refuse via Odoo
+  expenses.py             LasaPop only — hr.expense submit/approve/refuse, duplicate confirm, petty cash category/posting/balance
 scheduler/
   jobs.py                 One function per scheduled job — the only place scheduled
                            jobs call Slack chat.postMessage
@@ -62,7 +62,7 @@ google_sheets/
 | `customer_reminders`, `invoice_reminders`, `quotation_reminders`, `stock_alerts` | one row per reminder card — backs interactive buttons + same-day dedup |
 | `excluded_customers` | "Won't Buy" blacklist |
 | `integrity_alerted_orders` | orders already alerted on by the 30-day-uninvoiced check |
-| `expense_requests`, `cash_topups` | LasaPop only — expense approval + cash fund tracking |
+| `expense_requests`, `cash_topups` | LasaPop only — expense approval (incl. card location) + cash top-ups (no longer written with petty cash on; Odoo is the balance source) |
 
 Hourly (HEFS) / every-15-min (LasaPop) rolling backups live in `backups/`.
 
@@ -113,35 +113,52 @@ cash reconciliation) that exists in code but currently has **no `add_job()`
 call wiring it into the scheduler at all** (not even commented out — just
 never added). Built, not live.
 
-### What *is* live: expense approval + cash top-ups (Slack-native, no Odoo order dependency)
+### What *is* live: expense approval + petty cash (Slack-native, no Odoo order dependency)
 
-`@mention` commands: `expense <amount> <description>`, `expensetotal`,
-`cashin <amount> <note>` (admin only, `Config.ADMIN_USER_IDS`), `balance`,
-`help`. Same actions are also available as Slack shortcuts (⚡ icon): *提交支出*,
-*查询现金统计*, *充值现金*.
+> **Updated 2026-10-19:** expenses are now posted one by one from the factory petty cash
+> (`PETTY_CASH_ENABLED=true`) and top-ups are recorded by the AI assistant. The earlier design
+> ("never posts to accounting, monthly lump-sum booking") is retired. Staff/management
+> manuals: `docs/manuals/` in GitHub `hefstim/hermes-odoo`; Odoo-side setup: `docs/petty-cash/` there.
 
-Flow: `expense` mention → creates + submits a draft `hr.expense`
-(`odoo/expenses.py::create_and_submit_expense`) → posts an approval card to
-`SLACK_CHANNEL_EXPENSE_APPROVAL` (`#exp-approval`) → admin clicks
-Approve/Refuse → `approve_expense`/`refuse_expense` (refuse goes through
-`hr.expense.refuse.wizard`; `action_refuse()` on the record itself only opens
-a UI dialog, doesn't refuse) → local `expense_requests` row updated, Slack
-message edited in place. Optional receipt photos attached alongside the
-mention get downloaded and saved as an `ir.attachment` via `attach_receipt` —
-failure there logs but never blocks the expense submission.
+`@mention` commands: `expense <amount> <description>`, `expensetotal`, `cashin <amount> <note>` (admin only,
+`Config.ADMIN_USER_IDS`), `balance`, `help`. Same actions as Slack shortcuts (⚡ icon): *提交支出*,
+*查询现金统计* (posted in `#exp-approval`, not a DM), *充值现金*.
 
-`Config.EXPENSE_EMPLOYEE_MAP` (`.env`, `SlackUserID=OdooEmployeeID` pairs) is
-the only source of Slack→Odoo employee identity; a submitter not in the map
-gets rejected with a friendly message, not a crash.
+**Submit:** `expense` mention or the *提交支出* form → `odoo/expenses.py::create_and_submit_expense` creates and
+submits an `hr.expense` → approval card in `SLACK_CHANNEL_EXPENSE_APPROVAL` (`#exp-approval`). Attached images are
+saved as `ir.attachment` (`attach_receipt`); a failed upload is logged and never blocks the submission.
+`Config.EXPENSE_EMPLOYEE_MAP` (`.env`, `SlackUserID=OdooEmployeeID`) is the only Slack→Odoo identity source;
+unknown submitters get a friendly rejection.
 
-This feature deliberately never posts to formal Odoo accounting (no cash
-journal, no `action_post`/`action_pay`). Real bookkeeping is a separate
-monthly lump-sum cash withdrawal booked via a different AI-driven MCP tool
-(`record_expense` in `/root/.hermes/odoo_mcp_lasapop.py`, a completely
-different Odoo model). This feature's `hr.expense` records sitting at
-`approved` **are** the itemized detail ledger for where that lump sum went —
-don't suggest "closing the loop" into formal accounting unless the actual
-goal changes; it would duplicate/conflict with the existing lump booking.
+**Approve:** admin clicks Approve/Refuse → `slack/handlers.py::_update_expense` (atomically claims the local
+`expense_requests` row first, against double clicks) → `approve_expense` / `refuse_expense` (refuse goes
+through `hr.expense.refuse.wizard`; `action_refuse()` on the record only opens a UI dialog).
+
+- **Possible duplicates:** for the same employee, date and amount, Odoo's `action_approve` does **not**
+  raise — it returns the `hr.expense.approve.duplicate` wizard and leaves the expense submitted. Before
+  2026-10-19 the bot treated that as success (card said Approved, Odoo did not; expenses 12 and 17, fixed by
+  hand). Now `approve_expense` raises `DuplicateExpenseError`; `_ask_duplicate_confirmation` sends the approver a
+  private prompt with "Not a duplicate — approve / Cancel" (`expense_approve_duplicate` /
+  `expense_duplicate_cancel`); confirming approves only that expense through the wizard. The final Odoo state
+  is always read back; a mismatch raises and releases the claim so the click can be retried.
+- **Employees without an expense approver** (`hr.employee.expense_manager_id` empty) are auto-approved by Odoo
+  on submit, skipping the duplicate check (`hr.expense._can_be_autovalidated`). Set an approver for every new
+  employee; Wei Liu was given hellolee120 on 2026-10-19.
+
+**Petty cash (`Config.PETTY_CASH_ENABLED`, true since 2026-10-19):**
+
+| | Switch on | Switch off (old flow) |
+|---|---|---|
+| Payment mode | `company_account`, paid from Odoo journal `PCSH 工厂备用金` | `own_account` (employee paid) |
+| Category | Required on the form; drop-down on the card (block `expense_category` / action `expense_category_select`), **cannot approve without one**; `set_expense_category` writes the product | One default product |
+| After approval | `action_post` → state paid, entry Dr category account / Cr 101101 | Stays approved, never posted |
+| `balance` / stats | `get_petty_cash_balance()`: posted balance of 101101 in Odoo; `expensetotal` adds a per-category breakdown | Local `cash_topups` − approved total |
+| `cashin` / *充值现金* | Records nothing; points to the AI assistant (`record_petty_cash_topup`) | Writes local `cash_topups` |
+
+Categories live in `odoo/expenses.py::EXPENSE_CATEGORIES`, looked up by the Odoo product's internal reference
+`EXP-*`; each category's account (Freight 614000 … Equipment 151100 and Renovation 151200 as fixed assets) is set
+on the Odoo product, created by `petty_cash_setup.py`. Opening balance MISC/2026/10/0023 (Dr 101101 / Cr 600000
+PHP 31,868). Turning the switch off restores the old flow without code changes.
 
 ## ⚠️ Shared git remote — read before any git operation
 
