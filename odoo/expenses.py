@@ -12,7 +12,7 @@ DEFAULT_PRODUCT_ID = 6  # "Expenses" (generic/miscellaneous) category
 EXPENSE_CATEGORIES = [
     ("EXP-FREIGHT", "运费 / Freight"),
     ("EXP-TRANSPORT", "交通燃油 / Transport & Fuel"),
-    ("EXP-REPAIR", "维修耗材 / Repairs & Supplies"),
+    ("EXP-REPAIR", "配件耗材 / Parts & Supplies"),
     ("EXP-UTIL", "水电燃气 / Utilities"),
     ("EXP-MEAL", "餐饮 / Meals"),
     ("EXP-OFFICE", "办公网络 / Office & Internet"),
