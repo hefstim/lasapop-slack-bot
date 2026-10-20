@@ -26,18 +26,33 @@ COMMANDS = {
     "stock":      ("Low stock alert", "job_low_stock"),
 }
 
-HELP_TEXT = (
-    "*Available commands — mention me with any of these:*\n\n"
-    "`@lasapop_bot expense <amount> <description>` — Submit an expense for approval (attach a receipt photo if you have one)\n"
-    "`@lasapop_bot expensetotal` — This month's approved cash expense total + current cash balance\n"
-    "`@lasapop_bot cashin <amount> <note>` — Record a cash top-up into the factory cash fund (admin only)\n"
-    "`@lasapop_bot balance` — Current factory cash balance (top-ups minus approved expenses)\n"
-    "`@lasapop_bot help` — Show this help message\n\n"
-    "*Or click the ⚡ shortcuts icon next to the message box:*\n"
-    "  • *提交支出* — same as `expense`, as a form (supports receipt upload)\n"
-    "  • *查询现金统计* — same as `expensetotal`/`balance`, sent to you as a DM\n"
-    "  • *充值现金* — same as `cashin`, as a form (admin only)"
-)
+if Config.PETTY_CASH_ENABLED:
+    HELP_TEXT = (
+        "*Available commands — mention me with any of these:*\n\n"
+        "`@lasapop_bot expense <amount> <description>` — Submit an expense for approval (attach a receipt photo if you have one); "
+        "the approver picks the category\n"
+        "`@lasapop_bot expensetotal` — This month's spent expenses by employee and category + petty cash balance\n"
+        "`@lasapop_bot balance` — Current petty cash balance (from Odoo)\n"
+        "`@lasapop_bot cashin` — Top-ups are recorded through the AI assistant; this command only reminds you\n"
+        "`@lasapop_bot help` — Show this help message\n\n"
+        "*Or click the ⚡ shortcuts icon next to the message box:*\n"
+        "  • *提交支出* — submit an expense as a form: choose a category, upload the receipt (recommended)\n"
+        "  • *查询现金统计* — same as `expensetotal`, posted in #exp-approval\n"
+        "  • *充值现金* — reminds you to record top-ups through the AI assistant"
+    )
+else:
+    HELP_TEXT = (
+        "*Available commands — mention me with any of these:*\n\n"
+        "`@lasapop_bot expense <amount> <description>` — Submit an expense for approval (attach a receipt photo if you have one)\n"
+        "`@lasapop_bot expensetotal` — This month's approved cash expense total + current cash balance\n"
+        "`@lasapop_bot cashin <amount> <note>` — Record a cash top-up into the factory cash fund (admin only)\n"
+        "`@lasapop_bot balance` — Current factory cash balance (top-ups minus approved expenses)\n"
+        "`@lasapop_bot help` — Show this help message\n\n"
+        "*Or click the ⚡ shortcuts icon next to the message box:*\n"
+        "  • *提交支出* — same as `expense`, as a form (supports receipt upload)\n"
+        "  • *查询现金统计* — same as `expensetotal`/`balance`, posted in #exp-approval\n"
+        "  • *充值现金* — same as `cashin`, as a form (admin only)"
+    )
 
 
 def register_handlers(app: App):
