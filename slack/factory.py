@@ -233,7 +233,7 @@ def register_factory_handlers(app: App):
                 errors[f"qty_{i}"] = "请输入大于 0 的数量"
                 continue
             expiry = date.fromisoformat(exp_raw) if exp_raw else None
-            if expiry and expiry <= date.today():
+            if expiry and expiry <= factory._today():
                 errors[f"exp_{i}"] = "到期日必须晚于今天"
                 continue
             lines.append({"product_id": int(product["value"]), "qty": qty, "expiry": expiry, "supplier_lot": lot})
@@ -380,8 +380,11 @@ def _lot_form_view(form: str, meta: dict) -> dict:
                      dispatch_action=True)]
     if meta.get("product_id"):
         opts = [_option(_quant_label(q), str(q["quant_id"])) for q in quants if q["product_id"] == meta["product_id"]][:100]
-        blocks.append(_input("quant", "批次 · 位置 · 数量 / Lot", {"type": "static_select", "action_id": "v", "options": opts,
-                                                               "placeholder": {"type": "plain_text", "text": "选择批次"}}))
+        if opts:
+            blocks.append(_input("quant", "批次 · 位置 · 数量 / Lot", {"type": "static_select", "action_id": "v", "options": opts,
+                                                                   "placeholder": {"type": "plain_text", "text": "选择批次"}}))
+        else:
+            blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": "这个原料现在没有库存。"}]})
     else:
         blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": "先选原料，再选批次 · Pick the item first"}]})
     blocks.append(_input("qty", "数量 / Quantity", _qty_el()))

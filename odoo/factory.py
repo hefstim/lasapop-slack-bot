@@ -7,12 +7,46 @@ Owner decisions 2026-11-11:
 Lots are numbered by stock_picking_auto_create_lot on validation; the expiry
 comes from the form, else from the product's expiration_time.
 """
-from datetime import date, datetime, timedelta
+import html
+from datetime import date, datetime, time, timedelta
+from zoneinfo import ZoneInfo
 
 from config import Config
 from odoo.client import get_client
 
 MAX_LINES = 8
+TZ = ZoneInfo(Config.TIMEZONE or "Asia/Manila")
+UTC = ZoneInfo("UTC")
+
+
+def _local_date(value) -> str:
+    """Odoo UTC datetime string -> local calendar date (expiry 2027-10-31 16:00 UTC is 11-01 in Manila)."""
+    if not value:
+        return ""
+    return datetime.strptime(value[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC).astimezone(TZ).date().isoformat()
+
+
+def _utc_midnight(d: date) -> str:
+    """Local midnight of `d` as an Odoo UTC datetime string (same convention as the opening-stock lots)."""
+    return datetime.combine(d, time(), TZ).astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _today() -> date:
+    return datetime.now(TZ).date()
+
+
+def _post(model: str, rec_id: int, text: str, note: str = ""):
+    """Chatter note; `note` is user text, escaped."""
+    body = html.escape(text) + (f"<br/>备注：{html.escape(note)}" if note else "")
+    get_client().execute(model, "message_post", [rec_id], body=body, body_is_html=True,
+                         message_type="comment", subtype_xmlid="mail.mt_note")
+
+
+def _cancel_quietly(model: str, rec_id: int):
+    try:
+        get_client().execute(model, "action_cancel", [rec_id])
+    except Exception:
+        pass
 
 
 def _receipt_type() -> dict:
@@ -46,14 +80,21 @@ def create_receipt(partner_id: int, lines: list[dict], location_id: int | None, 
                    note: str = "") -> int:
     """Create and validate a receipt. `lines`: product_id, qty, expiry (date|None), supplier_lot.
 
-    Returns the picking id. Raises if Odoo does not end up with the picking done.
+    One move per product (Odoo merges same-product moves anyway) and one move
+    line per form line, so two supplier lots of the same material get two of
+    our lots with their own expiry. Returns the picking id; on any failure the
+    picking is cancelled and the error re-raised.
     """
     client = get_client()
     ptype = _receipt_type()
     src = ptype["default_location_src_id"][0]
     dest = location_id or ptype["default_location_dest_id"][0]
     products = {p["id"]: p for p in client.search_read(
-        "product.product", [("id", "in", [l["product_id"] for l in lines])], ["id", "uom_id", "tracking"])}
+        "product.product", [("id", "in", [l["product_id"] for l in lines])],
+        ["id", "uom_id", "expiration_time", "use_expiration_date"])}
+    totals: dict[int, float] = {}
+    for l in lines:
+        totals[l["product_id"]] = totals.get(l["product_id"], 0) + l["qty"]
     picking_id = client.execute("stock.picking", "create", {
         "picking_type_id": ptype["id"],
         "partner_id": partner_id,
@@ -61,36 +102,46 @@ def create_receipt(partner_id: int, lines: list[dict], location_id: int | None, 
         "location_dest_id": dest,
         "origin": f"Slack · {submitter}",
         "move_ids": [(0, 0, {
-            "product_id": l["product_id"],
-            "product_uom_qty": l["qty"],
-            "product_uom": products[l["product_id"]]["uom_id"][0],
+            "product_id": pid,
+            "product_uom_qty": qty,
+            "product_uom": products[pid]["uom_id"][0],
             "location_id": src,
             "location_dest_id": dest,
-        }) for l in lines],
+        }) for pid, qty in totals.items()],
     })
-    client.execute("stock.picking", "action_confirm", [picking_id])
-    moves = client.search_read("stock.move", [("picking_id", "=", picking_id)],
-                               ["id", "product_id", "product_uom_qty", "move_line_ids"], order="id")
-    for move, line in zip(moves, lines):
-        client.execute("stock.move", "write", [move["id"]], {"quantity": line["qty"]})
-        if line.get("expiry"):
-            mls = client.search_read("stock.move.line", [("move_id", "=", move["id"])], ["id"])
-            exp = datetime.combine(line["expiry"], datetime.min.time()).strftime("%Y-%m-%d %H:%M:%S")
-            client.execute("stock.move.line", "write", [m["id"] for m in mls], {"expiration_date": exp})
-    client.execute("stock.picking", "button_validate", [picking_id])
-
-    state = client.search_read("stock.picking", [("id", "=", picking_id)], ["state"])[0]["state"]
-    if state != "done":
-        raise RuntimeError(f"receipt {picking_id} not validated (state {state}); check it in Odoo")
-    for move, line in zip(moves, lines):
-        if line.get("supplier_lot"):
-            lot_ids = {m["lot_id"][0] for m in client.search_read(
-                "stock.move.line", [("move_id", "=", move["id"]), ("lot_id", "!=", False)], ["lot_id"])}
-            if lot_ids:
-                client.execute("stock.lot", "write", list(lot_ids), {"ref": f"供应商批号 {line['supplier_lot']}"})
-    body = f"Slack 收货，提交人 {submitter}" + (f"<br/>备注：{note}" if note else "")
-    client.execute("stock.picking", "message_post", [picking_id], body=body, message_type="comment",
-                   subtype_xmlid="mail.mt_note")
+    try:
+        client.execute("stock.picking", "action_confirm", [picking_id])
+        moves = {m["product_id"][0]: m for m in client.search_read(
+            "stock.move", [("picking_id", "=", picking_id)], ["id", "product_id", "product_uom"])}
+        old = client.search_read("stock.move.line", [("picking_id", "=", picking_id)], ["id"])
+        if old:
+            client.execute("stock.move.line", "unlink", [m["id"] for m in old])
+        ml_ids = []
+        for l in lines:
+            p = products[l["product_id"]]
+            vals = {
+                "move_id": moves[l["product_id"]]["id"], "picking_id": picking_id, "product_id": l["product_id"],
+                "product_uom_id": moves[l["product_id"]]["product_uom"][0], "quantity": l["qty"],
+                "location_id": src, "location_dest_id": dest, "picked": True,
+            }
+            expiry = l.get("expiry") or (_today() + timedelta(days=p["expiration_time"] or 365)
+                                          if p["use_expiration_date"] else None)
+            if expiry:
+                vals["expiration_date"] = _utc_midnight(expiry)
+            ml_ids.append(client.execute("stock.move.line", "create", vals))
+        client.execute("stock.picking", "button_validate", [picking_id])
+        state = client.search_read("stock.picking", [("id", "=", picking_id)], ["state"])[0]["state"]
+        if state != "done":
+            raise RuntimeError(f"收货单没有完成（{state}）")
+    except Exception:
+        _cancel_quietly("stock.picking", picking_id)
+        raise
+    for ml_id, l in zip(ml_ids, lines):
+        if l.get("supplier_lot"):
+            lot = client.search_read("stock.move.line", [("id", "=", ml_id)], ["lot_id"])[0]["lot_id"]
+            if lot:
+                client.execute("stock.lot", "write", [lot[0]], {"ref": f"供应商批号 {l['supplier_lot']}"})
+    _post("stock.picking", picking_id, f"Slack 收货，提交人 {submitter}", note)
     return picking_id
 
 
@@ -110,7 +161,7 @@ def receipt_summary(picking_id: int) -> dict:
         "lines": [{"product": m["product_id"][1], "qty": m["quantity"], "uom": m["product_uom_id"][1],
                    "lot": m["lot_id"][1] if m["lot_id"] else "",
                    "lot_ref": (lot_refs.get(m["lot_id"][0]) or "") if m["lot_id"] else "",
-                   "expiry": (m["expiration_date"] or "")[:10]} for m in mls],
+                   "expiry": _local_date(m["expiration_date"])} for m in mls],
     }
 
 
@@ -137,21 +188,17 @@ def undo_receipt(picking_id: int, admin: str) -> str:
         client.execute("stock.return.picking.line", "write", [l["id"]], {"quantity": qty})
     action = client.execute("stock.return.picking", "action_create_returns", [wiz], context=ctx)
     ret_id = action["res_id"]
-    client.execute("stock.picking", "action_assign", [ret_id])
-    client.execute("stock.picking", "button_validate", [ret_id])
-    ret = client.search_read("stock.picking", [("id", "=", ret_id)], ["name", "state"])[0]
-    if ret["state"] != "done":
-        client.execute("stock.picking", "action_cancel", [ret_id])
-        raise RuntimeError(f"return {ret['name']} not validated (state {ret['state']}), cancelled it")
-    client.execute("stock.picking", "message_post", [picking_id], body=f"已撤销（退回 {ret['name']}），操作人 {admin}",
-                   message_type="comment", subtype_xmlid="mail.mt_note")
+    try:
+        client.execute("stock.picking", "action_assign", [ret_id])
+        client.execute("stock.picking", "button_validate", [ret_id], context={"skip_expired": True})
+        ret = client.search_read("stock.picking", [("id", "=", ret_id)], ["name", "state"])[0]
+        if ret["state"] != "done":
+            raise RuntimeError(f"退回单 {ret['name']} 没有完成（{ret['state']}），可能货已经移走或用掉")
+    except Exception:
+        _cancel_quietly("stock.picking", ret_id)
+        raise
+    _post("stock.picking", picking_id, f"已撤销（退回 {ret['name']}），操作人 {admin}")
     return ret["name"]
-
-
-def default_expiry(product_id: int) -> date:
-    days = get_client().search_read("product.product", [("id", "=", product_id)],
-                                    ["expiration_time"])[0]["expiration_time"] or 365
-    return date.today() + timedelta(days=days)
 
 
 def list_receipt_locations() -> list[dict]:
@@ -187,7 +234,7 @@ def stock_quants(query: str = "", product_id: int | None = None, limit: int = 10
     lot_exp = {}
     lot_ids = [r["lot_id"][0] for r in rows if r["lot_id"]]
     if lot_ids:
-        lot_exp = {l["id"]: (l["expiration_date"] or "")[:10]
+        lot_exp = {l["id"]: _local_date(l["expiration_date"])
                    for l in get_client().search_read("stock.lot", [("id", "in", lot_ids)], ["expiration_date"])}
     out = [{
         "quant_id": r["id"], "product_id": r["product_id"][0], "product": r["product_id"][1],
@@ -221,18 +268,13 @@ def stock_quants_by_ids(ids: list[int]) -> list[dict]:
 
 def expiring_lots(days: int) -> list[dict]:
     """On-hand lots that expire within `days` (or already expired)."""
-    limit_date = (date.today() + timedelta(days=days)).isoformat()
+    limit_date = (_today() + timedelta(days=days)).isoformat()
     return [q for q in stock_quants(limit=1000) if q["expiry"] and q["expiry"] <= limit_date]
 
 
 def internal_locations() -> list[dict]:
     return get_client().search_read("stock.location", [("usage", "=", "internal")], ["id", "complete_name"],
                                     order="complete_name")
-
-
-def _note(model: str, rec_id: int, body: str):
-    get_client().execute(model, "message_post", [rec_id], body=body, message_type="comment",
-                         subtype_xmlid="mail.mt_note")
 
 
 # ── Internal transfer (e.g. main store → batching room) ──────────────────────
@@ -251,22 +293,26 @@ def transfer(quant_id: int, qty: float, dest_location_id: int, submitter: str, n
         "move_ids": [(0, 0, {"product_id": q["product_id"], "product_uom_qty": qty,
                              "location_id": q["location_id"], "location_dest_id": dest_location_id})],
     })
-    client.execute("stock.picking", "action_confirm", [picking_id])
-    move = client.search_read("stock.move", [("picking_id", "=", picking_id)], ["id", "product_uom"])[0]
-    old = client.search_read("stock.move.line", [("move_id", "=", move["id"])], ["id"])
-    if old:
-        client.execute("stock.move.line", "unlink", [m["id"] for m in old])
-    client.execute("stock.move.line", "create", {
-        "move_id": move["id"], "picking_id": picking_id, "product_id": q["product_id"],
-        "product_uom_id": move["product_uom"][0], "lot_id": q["lot_id"], "quantity": qty,
-        "location_id": q["location_id"], "location_dest_id": dest_location_id, "picked": True,
-    })
-    client.execute("stock.picking", "button_validate", [picking_id])
-    p = client.search_read("stock.picking", [("id", "=", picking_id)], ["name", "state"])[0]
-    if p["state"] != "done":
-        client.execute("stock.picking", "action_cancel", [picking_id])
-        raise RuntimeError(f"调拨 {p['name']} 没有完成（{p['state']}），已取消")
-    _note("stock.picking", picking_id, f"Slack 调拨，提交人 {submitter}" + (f"<br/>备注：{note}" if note else ""))
+    try:
+        client.execute("stock.picking", "action_confirm", [picking_id])
+        move = client.search_read("stock.move", [("picking_id", "=", picking_id)], ["id", "product_uom"])[0]
+        old = client.search_read("stock.move.line", [("move_id", "=", move["id"])], ["id"])
+        if old:
+            client.execute("stock.move.line", "unlink", [m["id"] for m in old])
+        client.execute("stock.move.line", "create", {
+            "move_id": move["id"], "picking_id": picking_id, "product_id": q["product_id"],
+            "product_uom_id": move["product_uom"][0], "lot_id": q["lot_id"], "quantity": qty,
+            "location_id": q["location_id"], "location_dest_id": dest_location_id, "picked": True,
+        })
+        # Moving an expired lot (e.g. to the rejects area) is allowed.
+        client.execute("stock.picking", "button_validate", [picking_id], context={"skip_expired": True})
+        p = client.search_read("stock.picking", [("id", "=", picking_id)], ["name", "state"])[0]
+        if p["state"] != "done":
+            raise RuntimeError(f"调拨 {p['name']} 没有完成（{p['state']}）")
+    except Exception:
+        _cancel_quietly("stock.picking", picking_id)
+        raise
+    _post("stock.picking", picking_id, f"Slack 调拨，提交人 {submitter}", note)
     return picking_id
 
 
@@ -291,7 +337,7 @@ def create_scrap(quant_id: int, qty: float, reason_id: int, submitter: str, note
         "scrap_qty": qty, "product_uom_id": uom, "reason_code_id": reason_id,
         "origin": f"Slack · {submitter}",
     })
-    _note("stock.scrap", scrap_id, f"Slack 报废申请，提交人 {submitter}" + (f"<br/>说明：{note}" if note else ""))
+    _post("stock.scrap", scrap_id, f"Slack 报废申请，提交人 {submitter}", note)
     return scrap_id
 
 
@@ -308,7 +354,7 @@ def approve_scrap(scrap_id: int, admin: str) -> str:
     s = client.search_read("stock.scrap", [("id", "=", scrap_id)], ["name", "state"])[0]
     if s["state"] != "done":
         raise RuntimeError(f"库存不够，报废没有完成（{s['name']}）" if isinstance(res, dict) else f"{s['name']} 状态 {s['state']}")
-    _note("stock.scrap", scrap_id, f"已批准，批准人 {admin}")
+    _post("stock.scrap", scrap_id, f"已批准，批准人 {admin}")
     return s["name"]
 
 
@@ -364,29 +410,38 @@ def produce(bom_id: int, qty: float, submitter: str, note: str = "") -> int:
         "product_id": product_id, "bom_id": bom_id, "product_qty": qty,
         "product_uom_id": bom["product_uom_id"][0], "origin": f"Slack · {submitter}",
     })
-    client.execute("mrp.production", "action_confirm", [mo_id])
-    client.execute("mrp.production", "action_assign", [mo_id])
-    short = []
-    for m in client.search_read("stock.move", [("raw_material_production_id", "=", mo_id)],
-                                ["product_id", "product_uom_qty", "quantity", "product_uom"]):
-        if m["quantity"] + 1e-6 < m["product_uom_qty"]:
-            short.append(f"{m['product_id'][1]} 需要 {m['product_uom_qty']:g}，库存只有 {m['quantity']:g} {m['product_uom'][1]}")
-    if short:
-        client.execute("mrp.production", "action_cancel", [mo_id])
-        raise RuntimeError("原料不够，没有登记：\n" + "\n".join(short))
-    mo = client.search_read("mrp.production", [("id", "=", mo_id)], ["product_tracking", "lot_producing_ids"])[0]
-    if mo["product_tracking"] == "lot" and not mo["lot_producing_ids"]:
-        client.execute("mrp.production", "action_generate_serial", [mo_id])
-    client.execute("mrp.production", "write", [mo_id], {"qty_producing": qty})
-    client.execute("mrp.production", "set_qty_producing", [mo_id])
-    raw = client.search_read("stock.move", [("raw_material_production_id", "=", mo_id)], ["id"])
-    client.execute("stock.move", "write", [m["id"] for m in raw], {"picked": True})
-    client.execute("mrp.production", "button_mark_done", [mo_id], context={"skip_redirection": True,
-                                                                           "skip_consumption": True})
-    state = client.search_read("mrp.production", [("id", "=", mo_id)], ["state", "name"])[0]
-    if state["state"] != "done":
-        raise RuntimeError(f"生产单 {state['name']} 没有完成（{state['state']}），请在 Odoo 查看")
-    _note("mrp.production", mo_id, f"Slack 生产登记，提交人 {submitter}" + (f"<br/>备注：{note}" if note else ""))
+    try:
+        client.execute("mrp.production", "action_confirm", [mo_id])
+        client.execute("mrp.production", "action_assign", [mo_id])
+        short = []
+        for m in client.search_read("stock.move", [("raw_material_production_id", "=", mo_id)],
+                                    ["product_id", "product_uom_qty", "quantity", "product_uom"]):
+            if m["quantity"] + 1e-6 < m["product_uom_qty"]:
+                short.append(f"{m['product_id'][1]} 需要 {m['product_uom_qty']:g}，库存只有 {m['quantity']:g} {m['product_uom'][1]}")
+        if short:
+            raise RuntimeError("原料不够，没有登记：\n" + "\n".join(short))
+        now = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
+        expired = client.search_read("stock.move.line", [("move_id.raw_material_production_id", "=", mo_id),
+                                                         ("lot_id.expiration_date", "<=", now)], ["lot_id", "product_id"])
+        if expired:
+            raise RuntimeError("用到了已过期的原料批次，没有登记：\n" + "\n".join(
+                f"{e['product_id'][1]} · {e['lot_id'][1]}" for e in expired) + "\n请先把过期批次报废。")
+        mo = client.search_read("mrp.production", [("id", "=", mo_id)], ["product_tracking", "lot_producing_ids"])[0]
+        if mo["product_tracking"] == "lot" and not mo["lot_producing_ids"]:
+            client.execute("mrp.production", "action_generate_serial", [mo_id])
+        client.execute("mrp.production", "write", [mo_id], {"qty_producing": qty})
+        client.execute("mrp.production", "set_qty_producing", [mo_id])
+        raw = client.search_read("stock.move", [("raw_material_production_id", "=", mo_id)], ["id"])
+        client.execute("stock.move", "write", [m["id"] for m in raw], {"picked": True})
+        client.execute("mrp.production", "button_mark_done", [mo_id], context={"skip_redirection": True,
+                                                                               "skip_consumption": True})
+        state = client.search_read("mrp.production", [("id", "=", mo_id)], ["state", "name"])[0]
+        if state["state"] != "done":
+            raise RuntimeError(f"生产单 {state['name']} 没有完成（{state['state']}）")
+    except Exception:
+        _cancel_quietly("mrp.production", mo_id)
+        raise
+    _post("mrp.production", mo_id, f"Slack 生产登记，提交人 {submitter}", note)
     return mo_id
 
 
@@ -399,7 +454,7 @@ def production_summary(mo_id: int) -> dict:
                               ["product_id", "lot_id", "quantity", "product_uom_id"], order="product_id")
     return {
         "name": mo["name"], "product": mo["product_id"][1], "qty": mo["qty_produced"], "uom": mo["product_uom_id"][1],
-        "lots": [f"{l['name']}" + (f"（到期 {l['expiration_date'][:10]}）" if l["expiration_date"] else "") for l in lots],
+        "lots": [f"{l['name']}" + (f"（到期 {_local_date(l['expiration_date'])}）" if l["expiration_date"] else "") for l in lots],
         "used": [f"{u['product_id'][1]} {u['quantity']:g} {u['product_uom_id'][1]}" + (f" · {u['lot_id'][1]}" if u["lot_id"] else "")
                  for u in used],
     }

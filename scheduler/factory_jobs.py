@@ -1,7 +1,5 @@
 """LasaPop factory scheduled jobs (registered in main.py only when FACTORY_ENABLED)."""
 import logging
-from datetime import date
-
 from slack_sdk import WebClient
 
 from config import Config
@@ -20,7 +18,7 @@ def job_expiring_lots():
         return
     if not rows:
         return
-    today = date.today().isoformat()
+    today = factory._today().isoformat()
     expired = [q for q in rows if q["expiry"] < today]
     soon = [q for q in rows if q["expiry"] >= today]
     line = lambda q: f"• `{q['lot']}` {q['product']} · {q['location']} · {q['qty']:g} {q['uom']} · 到期 {q['expiry']}"
