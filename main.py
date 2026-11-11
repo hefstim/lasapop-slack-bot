@@ -103,6 +103,11 @@ def build_scheduler() -> BackgroundScheduler:
     # corruption event doesn't wipe out all polling cursors / dedup state
     scheduler.add_job(db.backup_db, "interval", minutes=15, id="backup_state_db")
 
+    # LasaPop factory: 08:00 lots expiring within 30 days → warehouse channel
+    if Config.FACTORY_ENABLED:
+        from scheduler.factory_jobs import job_expiring_lots
+        scheduler.add_job(job_expiring_lots, CronTrigger(hour=8, minute=0, timezone=tz), id="factory_expiring_lots")
+
     return scheduler
 
 

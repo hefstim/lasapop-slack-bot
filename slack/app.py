@@ -9,6 +9,9 @@ logger = logging.getLogger(__name__)
 
 app = App(token=Config.SLACK_BOT_TOKEN, signing_secret=Config.SLACK_SIGNING_SECRET)
 register_handlers(app)
+if Config.FACTORY_ENABLED:
+    from slack.factory import register_factory_handlers
+    register_factory_handlers(app)
 
 # Debug: log every incoming event type
 @app.event({"type": "message"})

@@ -68,6 +68,12 @@ class Config:
     PETTY_CASH_ENABLED = os.getenv("PETTY_CASH_ENABLED", "false").lower() in ("1", "true", "yes")
     PETTY_CASH_ACCOUNT = os.getenv("PETTY_CASH_ACCOUNT", "101101")  # Cash - PHP
 
+    # LasaPop factory forms (slack/factory.py): who may submit, who may undo/approve
+    FACTORY_ENABLED = os.getenv("FACTORY_ENABLED", "false").lower() in ("1", "true", "yes")
+    FACTORY_USER_IDS: set[str] = set(u.strip() for u in os.getenv("FACTORY_USER_IDS", "").split(",") if u.strip())
+    FACTORY_ADMIN_IDS: set[str] = set(u.strip() for u in os.getenv("FACTORY_ADMIN_IDS", "").split(",") if u.strip())
+    SLACK_CHANNEL_PRODUCTION = os.getenv("SLACK_CHANNEL_PRODUCTION", "")
+
     # Slack user ID -> Odoo hr.employee id, for the `expense` mention command
     _RAW_EXPENSE_MAP = os.getenv("EXPENSE_EMPLOYEE_MAP", "")
     EXPENSE_EMPLOYEE_MAP: dict[str, int] = {}
