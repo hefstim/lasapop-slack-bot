@@ -59,89 +59,96 @@ def _option(text: str, value: str) -> dict:
     return {"text": {"type": "plain_text", "text": text[:75]}, "value": value}
 
 
-def _receipt_view(rows: int, vendors: list, materials: list, locations: list) -> dict:
+def _receipt_view(meta: dict) -> dict:
+    """Receipt form. `meta`: rows, partner_id, po_id, ver (bumped when a PO pre-fills the rows,
+    so Slack shows the new values instead of keeping what was typed), prefill [{product_id, qty}]."""
+    vendors, materials, locations = factory.list_vendors(), factory.list_materials(), factory.list_receipt_locations()
+    rows, ver = meta.get("rows", 1), meta.get("ver", 0)
+    prefill = meta.get("prefill") or []
     groups: dict[str, list] = {}
+    by_id = {}
     for m in materials:
         label = f"[{m['default_code']}] {m['name']} ({m['uom_id'][1]})" if m["default_code"] else m["name"]
-        groups.setdefault(m["categ_id"][1].split(" / ")[-1], []).append(_option(label, str(m["id"])))
+        opt = _option(label, str(m["id"]))
+        by_id[m["id"]] = opt
+        groups.setdefault(m["categ_id"][1].split(" / ")[-1], []).append(opt)
     option_groups = [{"label": {"type": "plain_text", "text": g[:75]}, "options": opts[:100]}
                      for g, opts in groups.items()]
     vendor_opts = [_option(v["name"], str(v["id"])) for v in vendors][:100]
-    default_vendor = next((o for o in vendor_opts if o["text"]["text"] == "FLG"), None)
-    loc_opts = [_option(l["complete_name"].replace("LP/Stock/", ""), str(l["id"])) for l in locations][:100]
-    default_loc = next((o for o in loc_opts if "Main Store" in o["text"]["text"]), loc_opts[0] if loc_opts else None)
-
-    vendor_el = {"type": "static_select", "action_id": "v", "options": vendor_opts,
+    if not meta.get("partner_id"):
+        flg = next((o for o in vendor_opts if o["text"]["text"] == "FLG"), None)
+        meta["partner_id"] = int(flg["value"]) if flg else None
+    vendor_el = {"type": "static_select", "action_id": "factory_receipt_vendor", "options": vendor_opts,
                  "placeholder": {"type": "plain_text", "text": "选择供应商"}}
-    if default_vendor:
-        vendor_el["initial_option"] = default_vendor
+    init = next((o for o in vendor_opts if o["value"] == str(meta.get("partner_id"))), None)
+    if init:
+        vendor_el["initial_option"] = init
+    loc_opts = [_option(l["complete_name"].replace("LP/Stock/", ""), str(l["id"])) for l in locations][:100]
     loc_el = {"type": "static_select", "action_id": "v", "options": loc_opts}
+    default_loc = next((o for o in loc_opts if "Main Store" in o["text"]["text"]), loc_opts[0] if loc_opts else None)
     if default_loc:
         loc_el["initial_option"] = default_loc
 
-    blocks = [
-        {"type": "input", "block_id": "vendor", "label": {"type": "plain_text", "text": "供应商 / Supplier"},
-         "element": vendor_el},
-        {"type": "input", "block_id": "location", "label": {"type": "plain_text", "text": "放到哪里 / Put in"},
-         "element": loc_el},
-    ]
+    blocks = [_input("vendor", "供应商 / Supplier", vendor_el, dispatch_action=True)]
+    pos = factory.open_purchase_orders(meta["partner_id"]) if meta.get("partner_id") else []
+    if pos:
+        po_opts = [_option(f"{p['name']} · {p['date_order'][:10]}" + (f" · {p['partner_ref']}" if p["partner_ref"] else ""),
+                           str(p["id"])) for p in pos]
+        po_el = {"type": "static_select", "action_id": "factory_receipt_po", "options": po_opts,
+                 "placeholder": {"type": "plain_text", "text": "有采购单就选（选填）"}}
+        init = next((o for o in po_opts if o["value"] == str(meta.get("po_id"))), None)
+        if init:
+            po_el["initial_option"] = init
+        blocks.append(_input("po", "采购单 / Purchase order（选填 optional）", po_el, optional=True, dispatch_action=True))
+        if not meta.get("po_id"):
+            blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text":
+                "这个供应商有未收完的采购单。选了采购单，原料和数量会自动填好，并按采购价计成本。"}]})
+    else:
+        blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text":
+            "这个供应商没有待收货的采购单，将按现有成本入库并提醒老板补价格。"}]})
+    blocks.append(_input("location", "放到哪里 / Put in", loc_el))
     for i in range(rows):
+        pre = prefill[i] if i < len(prefill) else {}
+        prod_el = {"type": "static_select", "action_id": "v", "option_groups": option_groups,
+                   "placeholder": {"type": "plain_text", "text": "选择原料"}}
+        if pre.get("product_id") in by_id:
+            prod_el["initial_option"] = by_id[pre["product_id"]]
+        qty_el = _qty_el()
+        if pre.get("qty"):
+            qty_el["initial_value"] = f"{pre['qty']:g}"
         blocks += [
             {"type": "header", "text": {"type": "plain_text", "text": f"原料 {i + 1} / Item {i + 1}"}},
-            {"type": "input", "block_id": f"prod_{i}", "label": {"type": "plain_text", "text": "原料 / Material"},
-             "element": {"type": "static_select", "action_id": "v", "option_groups": option_groups,
-                         "placeholder": {"type": "plain_text", "text": "选择原料"}}},
-            {"type": "input", "block_id": f"qty_{i}", "label": {"type": "plain_text", "text": "数量 / Quantity"},
-             "element": {"type": "number_input", "action_id": "v", "is_decimal_allowed": True, "min_value": "0.001"}},
-            {"type": "input", "block_id": f"exp_{i}", "optional": True,
-             "label": {"type": "plain_text", "text": "到期日 / Expiry（不填按保质期自动算）"},
-             "element": {"type": "datepicker", "action_id": "v"}},
-            {"type": "input", "block_id": f"lot_{i}", "optional": True,
-             "label": {"type": "plain_text", "text": "供应商批号 / Supplier lot no."},
-             "element": {"type": "plain_text_input", "action_id": "v"}},
+            _input(f"prod_{i}_{ver}", "原料 / Material", prod_el),
+            _input(f"qty_{i}_{ver}", "实收数量 / Quantity received", qty_el),
+            _input(f"exp_{i}_{ver}", "到期日 / Expiry（不填按保质期自动算）", {"type": "datepicker", "action_id": "v"}, optional=True),
+            _input(f"lot_{i}_{ver}", "供应商批号 / Supplier lot no.", {"type": "plain_text_input", "action_id": "v"}, optional=True),
         ]
     row_buttons = []
     if rows < factory.MAX_LINES:
-        row_buttons.append({"type": "button", "action_id": "factory_receipt_add_row",
-                            "text": {"type": "plain_text", "text": "➕ 加一行 / Add item"}})
+        row_buttons.append(_btn("factory_receipt_add_row", "➕ 加一行 / Add item"))
     if rows > 1:
-        row_buttons.append({"type": "button", "action_id": "factory_receipt_remove_row",
-                            "text": {"type": "plain_text", "text": "➖ 删最后一行 / Remove last"}})
+        row_buttons.append(_btn("factory_receipt_remove_row", "➖ 删最后一行 / Remove last"))
     if row_buttons:
         blocks.append({"type": "actions", "block_id": "rows", "elements": row_buttons})
-    blocks += [
-        {"type": "input", "block_id": "photo", "optional": True,
-         "label": {"type": "plain_text", "text": "送货单 / 货物照片 · Photos"},
-         "element": {"type": "file_input", "action_id": "v", "max_files": 5,
-                     "filetypes": ["png", "jpg", "jpeg", "heic", "pdf"]}},
-        {"type": "input", "block_id": "note", "optional": True, "label": {"type": "plain_text", "text": "备注 / Note"},
-         "element": {"type": "plain_text_input", "action_id": "v", "multiline": True}},
-    ]
-    return {
-        "type": "modal", "callback_id": "factory_receipt_modal",
-        "title": {"type": "plain_text", "text": "原料收货"},
-        "submit": {"type": "plain_text", "text": "确认入库"},
-        "close": {"type": "plain_text", "text": "取消"},
-        "private_metadata": json.dumps({"rows": rows}),
-        "blocks": blocks,
-    }
+    blocks += [_photo_block("送货单 / 货物照片 · Photos"), _note_block()]
+    return _modal("factory_receipt_modal", "原料收货", "确认入库", blocks, meta)
 
 
-def _form_data() -> tuple:
-    return factory.list_vendors(), factory.list_materials(), factory.list_receipt_locations()
-
-
-def _card_blocks(s: dict, submitter: str, photos: int) -> list:
+def _card_blocks(s: dict, submitter: str, photos: int, backorder: str = "") -> list:
     lines = []
     for l in s["lines"]:
         extra = f" · {l['lot_ref']}" if l["lot_ref"] else ""
         lines.append(f"• {l['product']} — *{l['qty']:g} {l['uom']}* · 批号 `{l['lot']}` · 到期 {l['expiry']}{extra}")
+    if s["po"]:
+        head = f"采购单：{s['po']}" + (f"（未到的部分留在欠单 {backorder}）" if backorder else "（已收齐）")
+    else:
+        head = "⚠️ 无采购单：按现有平均成本入库，已提醒老板补价格"
     ctx = f"提交人 {submitter} · 库位 {s['location'].replace('LP/Stock/', '')}"
     if photos:
         ctx += f" · 照片 {photos} 张已存到 Odoo"
     return [
         {"type": "section", "text": {"type": "mrkdwn",
-                                     "text": f"📦 *原料收货 {s['name']}* ✅ 已入库\n供应商：{s['partner']}\n" + "\n".join(lines)}},
+                                     "text": f"📦 *原料收货 {s['name']}* ✅ 已入库\n供应商：{s['partner']}\n{head}\n" + "\n".join(lines)}},
         {"type": "context", "elements": [{"type": "mrkdwn", "text": ctx}]},
         {"type": "actions", "block_id": "receipt_actions", "elements": [
             {"type": "button", "action_id": "factory_receipt_undo", "style": "danger", "value": str(s["id"]),
@@ -154,33 +161,31 @@ def _card_blocks(s: dict, submitter: str, photos: int) -> list:
     ]
 
 
-def _submit_receipt(client, user_id: str, partner_id: int, location_id: int, lines: list, files: list, note: str):
+def _submit_receipt(client, user_id: str, partner_id: int, location_id: int, lines: list, files: list, note: str,
+                    po_id: int | None = None):
     submitter = _name(client, user_id)
     try:
-        picking_id = factory.create_receipt(partner_id, lines, location_id, submitter, note)
+        picking_id = factory.create_receipt(partner_id, lines, location_id, submitter, note, po_id=po_id)
     except Exception as e:
-        logger.error("factory receipt failed: %s", e)
-        client.chat_postMessage(channel=user_id, text=f"❌ 收货没有登记成功，请重试或联系管理员。\n{e}")
-        client.chat_postMessage(channel=Config.SLACK_CHANNEL_MANAGEMENT,
-                                text=f"❌ {submitter} 的原料收货登记失败：{e}")
+        _fail(client, user_id, submitter, "原料收货", e)
         return
-    photos = 0
-    for f in files:
+    photos = _download(client, files)
+    for name, content in photos:
         try:
-            url, name = f.get("url_private"), f.get("name", "photo.jpg")
-            if not url and f.get("id"):
-                info = client.files_info(file=f["id"])["file"]
-                url, name = info.get("url_private"), info.get("name", name)
-            r = requests.get(url, headers={"Authorization": f"Bearer {Config.SLACK_BOT_TOKEN}"}, timeout=30)
-            r.raise_for_status()
-            factory.attach_file(picking_id, name, r.content)
-            photos += 1
+            factory.attach_file(picking_id, name, content)
         except Exception as e:
             logger.error("factory receipt %s: photo attach failed: %s", picking_id, e)
     s = factory.receipt_summary(picking_id)
-    s["id"] = picking_id
-    client.chat_postMessage(channel=Config.SLACK_CHANNEL_WAREHOUSE, blocks=_card_blocks(s, submitter, photos),
+    backorder = factory.backorder_of(picking_id) if po_id else ""
+    client.chat_postMessage(channel=Config.SLACK_CHANNEL_WAREHOUSE, blocks=_card_blocks(s, submitter, len(photos), backorder),
                             text=f"原料收货 {s['name']} 已入库")
+    if not po_id:
+        costs = factory.product_costs([l["product_id"] for l in s["lines"]])
+        detail = "\n".join(f"• {l['product']} {l['qty']:g} {l['uom']}，按现有成本 PHP {costs.get(l['product_id'], 0):,.2f}/{l['uom']} 入库"
+                           + ("（成本为 0）" if not costs.get(l["product_id"]) else "") for l in s["lines"])
+        client.chat_postMessage(channel=Config.SLACK_CHANNEL_MANAGEMENT, text=(
+            f"⚠️ *无采购单收货 {s['name']}*（{s['partner']}，提交人 {submitter}）\n{detail}\n"
+            "如果这批货的实际价格不同，请把单价告诉 Claude 调整成本；以后进货先在 Odoo 下采购单，收货时选上采购单。"))
 
 
 def register_factory_handlers(app: App):
@@ -188,28 +193,44 @@ def register_factory_handlers(app: App):
     @app.action("factory_receipt_open")
     def open_receipt(ack, body, client):
         ack()
-        user_id = body["user"]["id"]
-        if user_id not in Config.FACTORY_USER_IDS:
-            client.chat_postEphemeral(channel=body["channel"]["id"], user=user_id,
-                                      text="⛔ 你还没有开通工厂登记权限，请联系管理员。")
+        if _denied(client, body):
             return
-        client.views_open(trigger_id=body["trigger_id"], view=_receipt_view(1, *_form_data()))
+        client.views_open(trigger_id=body["trigger_id"], view=_receipt_view({"rows": 1}))
 
-    def _resize(body, client, delta):
+    def _refresh(body, client, change):
         view = body["view"]
-        rows = json.loads(view["private_metadata"] or "{}").get("rows", 1) + delta
-        rows = max(1, min(factory.MAX_LINES, rows))
-        client.views_update(view_id=view["id"], hash=view["hash"], view=_receipt_view(rows, *_form_data()))
+        meta = _meta(view)
+        change(meta, body["actions"][0])
+        meta["rows"] = max(1, min(factory.MAX_LINES, meta.get("rows", 1)))
+        client.views_update(view_id=view["id"], hash=view["hash"], view=_receipt_view(meta))
 
     @app.action("factory_receipt_add_row")
     def add_row(ack, body, client):
         ack()
-        _resize(body, client, 1)
+        _refresh(body, client, lambda m, a: m.update(rows=m.get("rows", 1) + 1))
 
     @app.action("factory_receipt_remove_row")
     def remove_row(ack, body, client):
         ack()
-        _resize(body, client, -1)
+        _refresh(body, client, lambda m, a: m.update(rows=m.get("rows", 1) - 1))
+
+    @app.action("factory_receipt_vendor")
+    def pick_vendor(ack, body, client):
+        ack()
+
+        def change(m, a):
+            m.update(partner_id=int(a["selected_option"]["value"]), po_id=None, prefill=[], ver=m.get("ver", 0) + 1)
+        _refresh(body, client, change)
+
+    @app.action("factory_receipt_po")
+    def pick_po(ack, body, client):
+        ack()
+
+        def change(m, a):
+            po_id = int(a["selected_option"]["value"]) if a.get("selected_option") else None
+            prefill = factory.po_remaining(po_id) if po_id else []
+            m.update(po_id=po_id, prefill=prefill, rows=max(1, len(prefill)), ver=m.get("ver", 0) + 1)
+        _refresh(body, client, change)
 
     @app.view("factory_receipt_modal")
     def submit_receipt(ack, body, client, view):
@@ -218,35 +239,33 @@ def register_factory_handlers(app: App):
             ack(response_action="errors", errors={"vendor": "你没有工厂登记权限"})
             return
         v = view["state"]["values"]
-        rows = json.loads(view["private_metadata"] or "{}").get("rows", 1)
+        meta = _meta(view)
+        rows, ver = meta.get("rows", 1), meta.get("ver", 0)
         errors, lines = {}, []
         for i in range(rows):
-            product = v[f"prod_{i}"]["v"].get("selected_option")
-            qty_raw = v[f"qty_{i}"]["v"].get("value")
-            exp_raw = v[f"exp_{i}"]["v"].get("selected_date")
-            lot = (v[f"lot_{i}"]["v"].get("value") or "").strip()
-            try:
-                qty = float(qty_raw)
-                if qty <= 0:
-                    raise ValueError
-            except (TypeError, ValueError):
-                errors[f"qty_{i}"] = "请输入大于 0 的数量"
+            product = v[f"prod_{i}_{ver}"]["v"].get("selected_option")
+            exp_raw = v[f"exp_{i}_{ver}"]["v"].get("selected_date")
+            lot = (v[f"lot_{i}_{ver}"]["v"].get("value") or "").strip()
+            qty = _qty_value(v, f"qty_{i}_{ver}", errors)
+            if qty is None:
                 continue
             expiry = date.fromisoformat(exp_raw) if exp_raw else None
             if expiry and expiry <= factory._today():
-                errors[f"exp_{i}"] = "到期日必须晚于今天"
+                errors[f"exp_{i}_{ver}"] = "到期日必须晚于今天"
                 continue
             lines.append({"product_id": int(product["value"]), "qty": qty, "expiry": expiry, "supplier_lot": lot})
         if errors:
             ack(response_action="errors", errors=errors)
             return
         ack()
-        partner_id = int(v["vendor"]["v"]["selected_option"]["value"])
+        partner_id = int(v["vendor"]["factory_receipt_vendor"]["selected_option"]["value"])
+        po_opt = (v.get("po") or {}).get("factory_receipt_po", {}).get("selected_option")
+        po_id = int(po_opt["value"]) if po_opt else None
         location_id = int(v["location"]["v"]["selected_option"]["value"])
         files = v.get("photo", {}).get("v", {}).get("files") or []
         note = (v.get("note", {}).get("v", {}).get("value") or "").strip()
         threading.Thread(target=_submit_receipt,
-                         args=(client, user_id, partner_id, location_id, lines, files, note), daemon=True).start()
+                         args=(client, user_id, partner_id, location_id, lines, files, note, po_id), daemon=True).start()
 
     @app.action("factory_receipt_undo")
     def undo(ack, body, client):

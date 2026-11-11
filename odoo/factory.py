@@ -76,43 +76,95 @@ def list_vendors() -> list[dict]:
     return rows
 
 
-def create_receipt(partner_id: int, lines: list[dict], location_id: int | None, submitter: str,
-                   note: str = "") -> int:
-    """Create and validate a receipt. `lines`: product_id, qty, expiry (date|None), supplier_lot.
+def open_purchase_orders(partner_id: int) -> list[dict]:
+    """Confirmed purchase orders of this vendor that still have goods to receive."""
+    return get_client().search_read(
+        "purchase.order", [("partner_id", "child_of", partner_id), ("state", "=", "purchase"),
+                           ("receipt_status", "in", ["pending", "partial"])],
+        ["id", "name", "date_order", "partner_ref"], order="date_order desc", limit=50)
 
-    One move per product (Odoo merges same-product moves anyway) and one move
-    line per form line, so two supplier lots of the same material get two of
-    our lots with their own expiry. Returns the picking id; on any failure the
-    picking is cancelled and the error re-raised.
+
+def po_remaining(po_id: int) -> list[dict]:
+    """Lines still to receive, in the product's own unit (the form's unit)."""
+    rows = get_client().search_read(
+        "purchase.order.line", [("order_id", "=", po_id), ("display_type", "=", False)],
+        ["product_id", "product_qty", "product_uom_qty", "qty_received"], order="sequence, id")
+    out = []
+    for r in rows:
+        if not r["product_qty"]:
+            continue
+        left = r["product_uom_qty"] * max(0.0, 1 - r["qty_received"] / r["product_qty"])
+        if left > 1e-6:
+            out.append({"product_id": r["product_id"][0], "qty": round(left, 3)})
+    return out
+
+
+def _pending_po_picking(po_id: int) -> dict:
+    rows = get_client().search_read(
+        "stock.picking", [("purchase_id", "=", po_id), ("picking_type_code", "=", "incoming"),
+                          ("state", "not in", ["done", "cancel"])],
+        ["id", "name", "location_id", "location_dest_id"], order="id", limit=1)
+    if not rows:
+        raise RuntimeError("这张采购单已经没有待收的货了")
+    return rows[0]
+
+
+def create_receipt(partner_id: int, lines: list[dict], location_id: int | None, submitter: str,
+                   note: str = "", po_id: int | None = None) -> int:
+    """Create (or, with `po_id`, use the purchase order's pending receipt) and validate it.
+
+    `lines`: product_id, qty (product unit), expiry (date|None), supplier_lot.
+    One move per product and one move line per form line, so two supplier lots of
+    the same material get two of our lots with their own expiry. With a PO the
+    goods are valued at the PO price and anything not delivered stays on a
+    backorder. Without a PO they are valued at the current average cost.
+    Returns the picking id; on failure a new picking is cancelled and the error re-raised.
     """
     client = get_client()
-    ptype = _receipt_type()
-    src = ptype["default_location_src_id"][0]
-    dest = location_id or ptype["default_location_dest_id"][0]
     products = {p["id"]: p for p in client.search_read(
         "product.product", [("id", "in", [l["product_id"] for l in lines])],
-        ["id", "uom_id", "expiration_time", "use_expiration_date"])}
+        ["id", "display_name", "uom_id", "expiration_time", "use_expiration_date"])}
     totals: dict[int, float] = {}
     for l in lines:
         totals[l["product_id"]] = totals.get(l["product_id"], 0) + l["qty"]
-    picking_id = client.execute("stock.picking", "create", {
-        "picking_type_id": ptype["id"],
-        "partner_id": partner_id,
-        "location_id": src,
-        "location_dest_id": dest,
-        "origin": f"Slack · {submitter}",
-        "move_ids": [(0, 0, {
-            "product_id": pid,
-            "product_uom_qty": qty,
-            "product_uom": products[pid]["uom_id"][0],
+
+    if po_id:
+        pk = _pending_po_picking(po_id)
+        picking_id, src = pk["id"], pk["location_id"][0]
+        dest = location_id or pk["location_dest_id"][0]
+        moves = {m["product_id"][0]: m for m in client.search_read(
+            "stock.move", [("picking_id", "=", picking_id), ("state", "not in", ["done", "cancel"])],
+            ["id", "product_id", "product_uom"])}
+        missing = [products[pid]["display_name"] for pid in totals if pid not in moves]
+        if missing:
+            raise RuntimeError("这些原料不在采购单上，请另外收货（不选采购单）：" + "、".join(missing))
+        if dest != pk["location_dest_id"][0]:
+            client.execute("stock.picking", "write", [picking_id], {"location_dest_id": dest})
+        created = False
+    else:
+        ptype = _receipt_type()
+        src = ptype["default_location_src_id"][0]
+        dest = location_id or ptype["default_location_dest_id"][0]
+        picking_id = client.execute("stock.picking", "create", {
+            "picking_type_id": ptype["id"],
+            "partner_id": partner_id,
             "location_id": src,
             "location_dest_id": dest,
-        }) for pid, qty in totals.items()],
-    })
+            "origin": f"Slack · {submitter}",
+            "move_ids": [(0, 0, {
+                "product_id": pid,
+                "product_uom_qty": qty,
+                "product_uom": products[pid]["uom_id"][0],
+                "location_id": src,
+                "location_dest_id": dest,
+            }) for pid, qty in totals.items()],
+        })
+        created = True
     try:
-        client.execute("stock.picking", "action_confirm", [picking_id])
-        moves = {m["product_id"][0]: m for m in client.search_read(
-            "stock.move", [("picking_id", "=", picking_id)], ["id", "product_id", "product_uom"])}
+        if created:
+            client.execute("stock.picking", "action_confirm", [picking_id])
+            moves = {m["product_id"][0]: m for m in client.search_read(
+                "stock.move", [("picking_id", "=", picking_id)], ["id", "product_id", "product_uom"])}
         old = client.search_read("stock.move.line", [("picking_id", "=", picking_id)], ["id"])
         if old:
             client.execute("stock.move.line", "unlink", [m["id"] for m in old])
@@ -121,7 +173,7 @@ def create_receipt(partner_id: int, lines: list[dict], location_id: int | None, 
             p = products[l["product_id"]]
             vals = {
                 "move_id": moves[l["product_id"]]["id"], "picking_id": picking_id, "product_id": l["product_id"],
-                "product_uom_id": moves[l["product_id"]]["product_uom"][0], "quantity": l["qty"],
+                "product_uom_id": p["uom_id"][0], "quantity": l["qty"],
                 "location_id": src, "location_dest_id": dest, "picked": True,
             }
             expiry = l.get("expiry") or (_today() + timedelta(days=p["expiration_time"] or 365)
@@ -129,26 +181,43 @@ def create_receipt(partner_id: int, lines: list[dict], location_id: int | None, 
             if expiry:
                 vals["expiration_date"] = _utc_midnight(expiry)
             ml_ids.append(client.execute("stock.move.line", "create", vals))
-        client.execute("stock.picking", "button_validate", [picking_id])
+        if po_id:
+            # Not-delivered PO lines must not be validated as received.
+            for pid, m in moves.items():
+                if pid not in totals:
+                    client.execute("stock.move", "write", [m["id"]], {"picked": False})
+        # skip_backorder without picking_ids_not_to_backorder = keep the rest on a backorder.
+        client.execute("stock.picking", "button_validate", [picking_id], context={"skip_backorder": True})
         state = client.search_read("stock.picking", [("id", "=", picking_id)], ["state"])[0]["state"]
         if state != "done":
             raise RuntimeError(f"收货单没有完成（{state}）")
     except Exception:
-        _cancel_quietly("stock.picking", picking_id)
+        if created:
+            _cancel_quietly("stock.picking", picking_id)
         raise
     for ml_id, l in zip(ml_ids, lines):
         if l.get("supplier_lot"):
             lot = client.search_read("stock.move.line", [("id", "=", ml_id)], ["lot_id"])[0]["lot_id"]
             if lot:
                 client.execute("stock.lot", "write", [lot[0]], {"ref": f"供应商批号 {l['supplier_lot']}"})
-    _post("stock.picking", picking_id, f"Slack 收货，提交人 {submitter}", note)
+    _post("stock.picking", picking_id, f"Slack 收货，提交人 {submitter}" + ("" if po_id else "（无采购单，按现有平均成本入库）"), note)
     return picking_id
+
+
+def backorder_of(picking_id: int) -> str:
+    rows = get_client().search_read("stock.picking", [("backorder_id", "=", picking_id)], ["name"], limit=1)
+    return rows[0]["name"] if rows else ""
+
+
+def product_costs(product_ids: list[int]) -> dict[int, float]:
+    return {p["id"]: p["standard_price"] for p in get_client().search_read(
+        "product.product", [("id", "in", product_ids)], ["standard_price"])}
 
 
 def receipt_summary(picking_id: int) -> dict:
     client = get_client()
     p = client.search_read("stock.picking", [("id", "=", picking_id)],
-                           ["name", "partner_id", "state", "date_done", "location_dest_id"])[0]
+                           ["name", "partner_id", "state", "date_done", "location_dest_id", "purchase_id"])[0]
     mls = client.search_read("stock.move.line", [("picking_id", "=", picking_id)],
                              ["product_id", "quantity", "product_uom_id", "lot_id", "expiration_date"], order="id")
     lot_refs = {}
@@ -157,8 +226,8 @@ def receipt_summary(picking_id: int) -> dict:
         lot_refs = {l["id"]: l["ref"] for l in client.search_read("stock.lot", [("id", "in", lot_ids)], ["ref"])}
     return {
         "id": picking_id, "name": p["name"], "partner": p["partner_id"][1] if p["partner_id"] else "", "state": p["state"],
-        "location": p["location_dest_id"][1],
-        "lines": [{"product": m["product_id"][1], "qty": m["quantity"], "uom": m["product_uom_id"][1],
+        "location": p["location_dest_id"][1], "po": p["purchase_id"][1] if p["purchase_id"] else "",
+        "lines": [{"product_id": m["product_id"][0], "product": m["product_id"][1], "qty": m["quantity"], "uom": m["product_uom_id"][1],
                    "lot": m["lot_id"][1] if m["lot_id"] else "",
                    "lot_ref": (lot_refs.get(m["lot_id"][0]) or "") if m["lot_id"] else "",
                    "expiry": _local_date(m["expiration_date"])} for m in mls],
