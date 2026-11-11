@@ -481,10 +481,10 @@ def bom_components(bom_id: int) -> list[dict]:
                                     ["product_id", "product_qty", "product_uom_id"], order="sequence, id")
 
 
-def suggest_lot(product_id: int) -> str:
+def suggest_lot(product_id: int, day: date | None = None) -> str:
     """Next finished-goods lot by the manual's rule: date-code-sequence, e.g. 20261020-F01-01."""
     code = get_client().search_read("product.product", [("id", "=", product_id)], ["default_code"])[0]["default_code"]
-    prefix = f"{_today():%Y%m%d}-{code or product_id}-"
+    prefix = f"{(day or _today()):%Y%m%d}-{code or product_id}-"
     names = [l["name"] for l in get_client().search_read(
         "stock.lot", [("product_id", "=", product_id), ("name", "=like", prefix + "%")], ["name"])]
     seqs = [int(n[len(prefix):]) for n in names if n[len(prefix):].isdigit()]
@@ -517,38 +517,143 @@ def _pick(product_id: int, need: float) -> tuple[list, float]:
     return picks, left
 
 
-def produce(bom_id: int, qty: float, submitter: str, note: str = "", lot_name: str = "",
-            actual: dict[int, float] | None = None) -> int:
-    """Create an MO from a BOM and close it at once.
-
-    `lot_name`: finished-goods lot (manual rule date-code-seq); suggested when empty.
-    `actual`: product_id -> quantity really used, for components that differ from the recipe.
-    Components are taken by PICK_ORDER; on any failure the MO is cancelled.
-    """
+def _check_lot(product_id: int, lot_name: str) -> str:
     import re
+    lot_name = (lot_name or suggest_lot(product_id)).strip()
+    if not re.match(LOT_RE, lot_name):
+        raise RuntimeError(f"成品批号 {lot_name} 格式不对，应为 日期-成品代码-序号，例如 20261020-F01-01")
+    if get_client().execute("stock.lot", "search_count", [("product_id", "=", product_id), ("name", "=", lot_name)]):
+        raise RuntimeError(f"成品批号 {lot_name} 已经用过了")
+    return lot_name
+
+
+def _create_mo(bom_id: int, qty: float, submitter: str, lot_name: str, planned: date | None = None) -> int:
+    """Confirmed MO with its finished-goods lot (expiry counted from the production date)."""
     client = get_client()
-    actual = actual or {}
     bom = client.search_read("mrp.bom", [("id", "=", bom_id)], ["product_uom_id"])[0]
     product_id = bom_product(bom_id)
-    tracking = client.search_read("product.product", [("id", "=", product_id)], ["tracking"])[0]["tracking"]
-    if tracking == "lot":
-        lot_name = (lot_name or suggest_lot(product_id)).strip()
-        if not re.match(LOT_RE, lot_name):
-            raise RuntimeError(f"成品批号 {lot_name} 格式不对，应为 日期-成品代码-序号，例如 20261020-F01-01")
-        if client.execute("stock.lot", "search_count", [("product_id", "=", product_id), ("name", "=", lot_name)]):
-            raise RuntimeError(f"成品批号 {lot_name} 已经用过了")
-    mo_id = client.execute("mrp.production", "create", {
-        "product_id": product_id, "bom_id": bom_id, "product_qty": qty,
-        "product_uom_id": bom["product_uom_id"][0], "origin": f"Slack · {submitter}",
-    })
+    prod = client.search_read("product.product", [("id", "=", product_id)],
+                              ["tracking", "use_expiration_date", "expiration_time"])[0]
+    day = planned or _today()
+    if prod["tracking"] == "lot":
+        lot_name = _check_lot(product_id, lot_name or suggest_lot(product_id, day))
+    vals = {"product_id": product_id, "bom_id": bom_id, "product_qty": qty,
+            "product_uom_id": bom["product_uom_id"][0], "origin": f"Slack · {submitter}"}
+    if planned:
+        vals["date_start"] = datetime.combine(planned, time(8), TZ).astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S")
+    mo_id = client.execute("mrp.production", "create", vals)
     try:
         client.execute("mrp.production", "action_confirm", [mo_id])
-        if tracking == "lot":
-            lot_id = client.execute("stock.lot", "create", {"name": lot_name, "product_id": product_id})
+        if prod["tracking"] == "lot":
+            lot_vals = {"name": lot_name, "product_id": product_id}
+            if prod["use_expiration_date"]:
+                lot_vals["expiration_date"] = _utc_midnight(day + timedelta(days=prod["expiration_time"] or 0))
+            lot_id = client.execute("stock.lot", "create", lot_vals)
+            client.execute("mrp.production", "write", [mo_id], {"lot_producing_ids": [(6, 0, [lot_id])]})
+    except Exception:
+        _cancel_quietly("mrp.production", mo_id)
+        raise
+    return mo_id
+
+
+def plan_production(bom_id: int, qty: float, planned: date, submitter: str, note: str = "", lot_name: str = "") -> int:
+    """Production plan = a confirmed MO with its lot fixed, nothing consumed yet."""
+    mo_id = _create_mo(bom_id, qty, submitter, lot_name, planned)
+    _post("mrp.production", mo_id, f"Slack 生产计划，计划人 {submitter}", note)
+    return mo_id
+
+
+def open_productions() -> list[dict]:
+    """Plans not finished yet (made in Slack or in Odoo)."""
+    rows = get_client().search_read(
+        "mrp.production", [("state", "in", ["confirmed", "progress", "to_close"])],
+        ["id", "name", "product_id", "product_qty", "product_uom_id", "lot_producing_ids", "date_start", "bom_id"],
+        order="date_start, id", limit=100)
+    lot_ids = [l for r in rows for l in r["lot_producing_ids"]]
+    names = {l["id"]: l["name"] for l in get_client().search_read("stock.lot", [("id", "in", lot_ids)], ["name"])} if lot_ids else {}
+    for r in rows:
+        r["lot"] = ", ".join(names.get(i, "") for i in r["lot_producing_ids"])
+        r["day"] = _local_date(r["date_start"])
+    return rows
+
+
+def cancel_plan(mo_id: int, who: str) -> str:
+    client = get_client()
+    mo = client.search_read("mrp.production", [("id", "=", mo_id)], ["name", "state", "lot_producing_ids"])[0]
+    if mo["state"] in ("done", "cancel"):
+        raise RuntimeError(f"{mo['name']} 已经{'完成' if mo['state'] == 'done' else '取消'}了")
+    client.execute("mrp.production", "action_cancel", [mo_id])
+    _post("mrp.production", mo_id, f"计划已取消，操作人 {who}")
+    for lot_id in mo["lot_producing_ids"]:
+        try:   # free the lot number again if nothing was made with it
+            if not client.execute("stock.move.line", "search_count", [("lot_id", "=", lot_id)]):
+                client.execute("mrp.production", "write", [mo_id], {"lot_producing_ids": [(3, lot_id)]})
+                client.execute("stock.lot", "unlink", [lot_id])
+        except Exception:
+            pass
+    return mo["name"]
+
+
+def plan_materials(mo_id: int) -> list[dict]:
+    """What the plan needs, and what is free per area, for the card and the printed order."""
+    client = get_client()
+    out = []
+    today = _today().isoformat()
+    for m in client.search_read("stock.move", [("raw_material_production_id", "=", mo_id), ("state", "!=", "cancel")],
+                                ["product_id", "product_uom_qty", "product_uom"], order="id"):
+        quants = [q for q in stock_quants(product_id=m["product_id"][0], limit=500)
+                  if q["free"] > 0 and not any(n in q["location"] for n in NO_PICK)
+                  and not (q["expiry"] and q["expiry"] <= today)]
+        free = {name: sum(q["free"] for q in quants if name in q["location"]) for name in PICK_ORDER}
+        total = sum(q["free"] for q in quants)
+        lots = []
+        for q in sorted(quants, key=lambda q: q["expiry"] or "9999"):
+            label = f"{q['lot']}" + (f"（{q['expiry']}）" if q["expiry"] else "")
+            if label not in lots:
+                lots.append(label)
+        out.append({"product": m["product_id"][1], "need": m["product_uom_qty"], "uom": m["product_uom"][1],
+                    "free": free, "total": total, "short": max(0.0, m["product_uom_qty"] - total), "lots": lots[:2]})
+    return out
+
+
+def mo_info(mo_id: int) -> dict:
+    client = get_client()
+    mo = client.search_read("mrp.production", [("id", "=", mo_id)],
+                            ["name", "product_id", "product_qty", "qty_produced", "product_uom_id", "lot_producing_ids",
+                             "date_start", "state", "bom_id"])[0]
+    lots = client.search_read("stock.lot", [("id", "in", mo["lot_producing_ids"])], ["name", "expiration_date"])
+    mo["lot"] = lots[0]["name"] if lots else ""
+    mo["expiry"] = _local_date(lots[0]["expiration_date"]) if lots and lots[0]["expiration_date"] else ""
+    mo["day"] = _local_date(mo["date_start"])
+    return mo
+
+
+def finish_production(mo_id: int, qty: float, submitter: str, note: str = "",
+                      actual: dict[int, float] | None = None, cancel_on_error: bool = False) -> int:
+    """Consume components and close the MO with the real output.
+
+    Components default to the recipe scaled to the real output; `actual` overrides per product.
+    They are taken by PICK_ORDER. Producing less than planned closes the MO (no backorder).
+    """
+    client = get_client()
+    actual = actual or {}
+    mo = client.search_read("mrp.production", [("id", "=", mo_id)],
+                            ["state", "product_qty", "name", "product_id", "product_tracking", "lot_producing_ids"])[0]
+    if mo["state"] not in ("confirmed", "progress", "to_close"):
+        raise RuntimeError(f"{mo['name']} 已经完成或取消了")
+    try:
+        if mo["product_tracking"] == "lot" and not mo["lot_producing_ids"]:
+            # Plan made in Odoo without a lot: give it today's next lot by the manual's rule.
+            pid = mo["product_id"][0]
+            prod = client.search_read("product.product", [("id", "=", pid)], ["use_expiration_date", "expiration_time"])[0]
+            lot_vals = {"name": suggest_lot(pid), "product_id": pid}
+            if prod["use_expiration_date"]:
+                lot_vals["expiration_date"] = _utc_midnight(_today() + timedelta(days=prod["expiration_time"] or 0))
+            lot_id = client.execute("stock.lot", "create", lot_vals)
             client.execute("mrp.production", "write", [mo_id], {"lot_producing_ids": [(6, 0, [lot_id])]})
         client.execute("mrp.production", "write", [mo_id], {"qty_producing": qty})
         client.execute("mrp.production", "set_qty_producing", [mo_id])
-        raws = client.search_read("stock.move", [("raw_material_production_id", "=", mo_id)],
+        raws = client.search_read("stock.move", [("raw_material_production_id", "=", mo_id), ("state", "!=", "cancel")],
                                   ["id", "product_id", "product_uom_qty", "product_uom", "location_dest_id"])
         uoms = {p["id"]: p["uom_id"][0] for p in client.search_read(
             "product.product", [("id", "in", [m["product_id"][0] for m in raws])], ["uom_id"])}
@@ -557,11 +662,10 @@ def produce(bom_id: int, qty: float, submitter: str, note: str = "", lot_name: s
             pid = m["product_id"][0]
             if m["product_uom"][0] != uoms[pid]:
                 raise RuntimeError(f"{m['product_id'][1]} 的配方单位和库存单位不同，请在 Odoo 处理")
-            need = actual.get(pid, m["product_uom_qty"])
+            need = actual.get(pid, round(m["product_uom_qty"] * qty / mo["product_qty"], 6))
             picks, left = _pick(pid, need)
             if left > 1e-6:
-                have = need - left
-                short.append(f"{m['product_id'][1]} 需要 {need:g}，可用库存只有 {have:g} {m['product_uom'][1]}")
+                short.append(f"{m['product_id'][1]} 需要 {need:g}，可用库存只有 {need - left:g} {m['product_uom'][1]}")
             plan.append((m, picks))
         if short:
             raise RuntimeError("原料不够（已过期、不良品区和成品仓的货不算），没有登记：\n" + "\n".join(short))
@@ -576,27 +680,36 @@ def produce(bom_id: int, qty: float, submitter: str, note: str = "", lot_name: s
                     "location_dest_id": m["location_dest_id"][0], "picked": True,
                 })
         client.execute("stock.move", "write", [m["id"] for m, _ in plan], {"picked": True})
-        client.execute("mrp.production", "button_mark_done", [mo_id], context={"skip_redirection": True,
-                                                                               "skip_consumption": True})
-        state = client.search_read("mrp.production", [("id", "=", mo_id)], ["state", "name"])[0]
-        if state["state"] != "done":
-            raise RuntimeError(f"生产单 {state['name']} 没有完成（{state['state']}）")
+        client.execute("mrp.production", "button_mark_done", [mo_id], context={
+            "skip_redirection": True, "skip_consumption": True, "skip_backorder": True})
+        state = client.search_read("mrp.production", [("id", "=", mo_id)], ["state"])[0]["state"]
+        if state != "done":
+            raise RuntimeError(f"生产单 {mo['name']} 没有完成（{state}）")
     except Exception:
-        _cancel_quietly("mrp.production", mo_id)
+        if cancel_on_error:
+            _cancel_quietly("mrp.production", mo_id)
         raise
-    _post("mrp.production", mo_id, f"Slack 生产登记，提交人 {submitter}", note)
+    _post("mrp.production", mo_id, f"Slack 完工登记，提交人 {submitter}，实际产量 {qty:g}", note)
     return mo_id
+
+
+def produce(bom_id: int, qty: float, submitter: str, note: str = "", lot_name: str = "",
+            actual: dict[int, float] | None = None) -> int:
+    """Production without a plan: create the MO and finish it at once (cancelled again on failure)."""
+    mo_id = _create_mo(bom_id, qty, submitter, lot_name)
+    return finish_production(mo_id, qty, submitter, note, actual, cancel_on_error=True)
 
 
 def production_summary(mo_id: int) -> dict:
     client = get_client()
     mo = client.search_read("mrp.production", [("id", "=", mo_id)],
-                            ["name", "product_id", "qty_produced", "product_uom_id", "lot_producing_ids"])[0]
+                            ["name", "product_id", "qty_produced", "product_qty", "product_uom_id", "lot_producing_ids"])[0]
     lots = client.search_read("stock.lot", [("id", "in", mo["lot_producing_ids"])], ["name", "expiration_date"])
     used = client.search_read("stock.move.line", [("move_id.raw_material_production_id", "=", mo_id)],
                               ["product_id", "lot_id", "quantity", "product_uom_id", "location_id"], order="product_id")
     return {
-        "name": mo["name"], "product": mo["product_id"][1], "qty": mo["qty_produced"], "uom": mo["product_uom_id"][1],
+        "name": mo["name"], "product": mo["product_id"][1], "qty": mo["qty_produced"], "planned": mo["product_qty"],
+        "uom": mo["product_uom_id"][1],
         "lots": [f"{l['name']}" + (f"（到期 {_local_date(l['expiration_date'])}）" if l["expiration_date"] else "") for l in lots],
         "used": [f"{u['product_id'][1]} {u['quantity']:g} {u['product_uom_id'][1]}" + (f" · {u['lot_id'][1]}" if u["lot_id"] else "")
                  + f" · {_short_loc(u['location_id'][1])}" for u in used],

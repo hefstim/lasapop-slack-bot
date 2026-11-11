@@ -31,7 +31,8 @@ def _btn(action_id: str, text: str, style: str = "") -> dict:
 
 def menu_blocks(kind: str = "warehouse") -> list:
     if kind == "production":
-        buttons = [_btn("factory_produce_open", "🏭 生产入库 / Production", "primary"),
+        buttons = [_btn("factory_plan_open", "📝 生产计划 / Plan", "primary"),
+                   _btn("factory_produce_open", "🏭 完工登记 / Finish"),
                    _btn("factory_query_open", "🔍 查库存 / Stock")]
         title = "*🏭 生产登记 / Production forms*"
     else:
@@ -441,15 +442,35 @@ def _count_view(meta: dict) -> dict:
     return _modal("factory_count_modal", "盘点", "提交审批" if meta.get("location_id") else None, blocks, meta)
 
 
-def _produce_view(meta: dict) -> dict:
-    """Pick a product (recipe) first; the form then fills in the suggested lot and lists the components."""
+def _bom_options(boms: list) -> list:
+    return [_option(f"{b['product_tmpl_id'][1]}（配方每 {b['product_qty']:g} {b['product_uom_id'][1]}）"
+                    + (f" {b['code']}" if b["code"] else ""), str(b["id"])) for b in boms][:100]
+
+
+def _no_bom_view(callback_id: str, title: str) -> dict:
+    return _modal(callback_id, title, None, [{"type": "section", "text": {"type": "mrkdwn", "text":
+        "还没有配方（BOM）。请管理员先在 Odoo 录入配方，再用这个表单。"}}], {})
+
+
+def _component_blocks(bom: dict, ver: int) -> list:
+    blocks = [{"type": "header", "text": {"type": "plain_text", "text": "实际用量 / Actual use"}},
+              {"type": "context", "elements": [{"type": "mrkdwn", "text":
+                  "和配方不同才填，不填就按配方和实际产量算 · Only when different from the recipe"}]}]
+    for c in factory.bom_components(bom["id"]):
+        blocks.append(_input(f"c_{c['product_id'][0]}_{ver}",
+                             f"{c['product_id'][1]}（配方每 {bom['product_qty']:g} 用 {c['product_qty']:g} {c['product_uom_id'][1]}）"[:150],
+                             {"type": "number_input", "action_id": "v", "is_decimal_allowed": True, "min_value": "0"},
+                             optional=True))
+    return blocks
+
+
+def _plan_view(meta: dict) -> dict:
+    """Production plan: product → date → lot (suggested for that date) → planned quantity."""
     boms = factory.list_boms()
     if not boms:
-        return _modal("factory_produce_modal", "生产入库", None, [{"type": "section", "text": {"type": "mrkdwn", "text":
-            "还没有配方（BOM）。请管理员先在 Odoo 录入配方，再用这个表单。"}}], {})
-    opts = [_option(f"{b['product_tmpl_id'][1]}（配方每 {b['product_qty']:g} {b['product_uom_id'][1]}）"
-                    + (f" {b['code']}" if b["code"] else ""), str(b["id"])) for b in boms][:100]
-    bom_el = {"type": "static_select", "action_id": "factory_pick_bom", "options": opts,
+        return _no_bom_view("factory_plan_modal", "生产计划")
+    opts = _bom_options(boms)
+    bom_el = {"type": "static_select", "action_id": "factory_plan_bom", "options": opts,
               "placeholder": {"type": "plain_text", "text": "选择产品"}}
     init = next((o for o in opts if o["value"] == str(meta.get("bom_id"))), None)
     if init:
@@ -457,23 +478,72 @@ def _produce_view(meta: dict) -> dict:
     blocks = [_input("bom", "产品 / Product", bom_el, dispatch_action=True)]
     if not meta.get("bom_id"):
         blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": "先选产品 · Pick the product first"}]})
-        return _modal("factory_produce_modal", "生产入库", None, blocks, meta)
+        return _modal("factory_plan_modal", "生产计划", None, blocks, meta)
+    bom = next(b for b in boms if b["id"] == meta["bom_id"])
+    day = meta.get("day") or factory._today().isoformat()
+    ver = meta.get("ver", 0)
+    blocks += [
+        _input("day", "生产日期 / Production date", {"type": "datepicker", "action_id": "factory_plan_day", "initial_date": day},
+               dispatch_action=True),
+        _input(f"lot_{ver}", "成品批号 / Lot（喷码机设成这个号）",
+               {"type": "plain_text_input", "action_id": "v",
+                "initial_value": factory.suggest_lot(factory.bom_product(bom["id"]), date.fromisoformat(day))}),
+        _input("qty", f"计划数量（{bom['product_uom_id'][1]}）/ Planned quantity", _qty_el()),
+        _note_block(),
+    ]
+    return _modal("factory_plan_modal", "生产计划", "提交计划", blocks, meta)
+
+
+def _produce_view(meta: dict) -> dict:
+    """Finish production: pick an open plan (from Slack or Odoo), or record without a plan."""
+    ver = meta.get("ver", 0)
+    plans = factory.open_productions()
+    opts = [_option(f"{p['name']} · {p['product_id'][1]} · {p['product_qty']:g} {p['product_uom_id'][1]}"
+                    + (f" · {p['lot']}" if p["lot"] else "") + (f" · {p['day'][5:]}" if p["day"] else ""), str(p["id"]))
+            for p in plans][:99]
+    opts.append(_option("（没有计划，直接登记）/ No plan", "0"))
+    plan_el = {"type": "static_select", "action_id": "factory_pick_plan", "options": opts,
+               "placeholder": {"type": "plain_text", "text": "选择生产计划"}}
+    init = next((o for o in opts if o["value"] == str(meta.get("mo_id"))), None)
+    if init:
+        plan_el["initial_option"] = init
+    blocks = [_input("plan", "生产计划 / Plan", plan_el, dispatch_action=True)]
+    mode = meta.get("mode")
+    if not mode:
+        blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text":
+            "选要完工的计划；临时生产选“没有计划，直接登记” · Pick the plan you finished"}]})
+        return _modal("factory_produce_modal", "完工登记", None, blocks, meta)
+    if mode == "mo":
+        mo = factory.mo_info(meta["mo_id"])
+        bom = next((b for b in factory.list_boms() if mo["bom_id"] and b["id"] == mo["bom_id"][0]), None)
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text":
+            f"*{mo['product_id'][1]}*\n成品批号 `{mo['lot'] or '—'}` · 到期 {mo['expiry'] or '—'} · 计划 {mo['product_qty']:g} {mo['product_uom_id'][1]}"}})
+        qty_el = _qty_el()
+        qty_el["initial_value"] = f"{mo['product_qty']:g}"
+        blocks.append(_input(f"qty_{ver}", f"实际产量（{mo['product_uom_id'][1]}）/ Real output", qty_el))
+        if bom:
+            blocks += _component_blocks(bom, ver)
+        blocks.append(_note_block())
+        return _modal("factory_produce_modal", "完工登记", "确认入库", blocks, meta)
+    boms = factory.list_boms()
+    if not boms:
+        return _no_bom_view("factory_produce_modal", "完工登记")
+    bopts = _bom_options(boms)
+    bom_el = {"type": "static_select", "action_id": "factory_pick_bom", "options": bopts,
+              "placeholder": {"type": "plain_text", "text": "选择产品"}}
+    init = next((o for o in bopts if o["value"] == str(meta.get("bom_id"))), None)
+    if init:
+        bom_el["initial_option"] = init
+    blocks.append(_input("bom", "产品 / Product", bom_el, dispatch_action=True))
+    if not meta.get("bom_id"):
+        return _modal("factory_produce_modal", "完工登记", None, blocks, meta)
     bom = next(b for b in boms if b["id"] == meta["bom_id"])
     blocks += [
-        _input("lot", "成品批号 / Lot（和喷码机一致）",
+        _input(f"lot_{ver}", "成品批号 / Lot（和喷码机一致）",
                {"type": "plain_text_input", "action_id": "v", "initial_value": factory.suggest_lot(factory.bom_product(bom["id"]))}),
-        _input("qty", f"实际产量（{bom['product_uom_id'][1]}）/ Quantity made", _qty_el()),
-        {"type": "header", "text": {"type": "plain_text", "text": "实际用量 / Actual use"}},
-        {"type": "context", "elements": [{"type": "mrkdwn", "text":
-            "和配方不同才填，不填就按配方算 · Only fill in when different from the recipe"}]},
-    ]
-    for c in factory.bom_components(bom["id"]):
-        blocks.append(_input(f"c_{c['product_id'][0]}",
-                             f"{c['product_id'][1]}（配方每 {bom['product_qty']:g} 用 {c['product_qty']:g} {c['product_uom_id'][1]}）"[:150],
-                             {"type": "number_input", "action_id": "v", "is_decimal_allowed": True, "min_value": "0"},
-                             optional=True))
-    blocks.append(_note_block())
-    return _modal("factory_produce_modal", "生产入库", "确认入库", blocks, meta)
+        _input(f"qty_{ver}", f"实际产量（{bom['product_uom_id'][1]}）/ Real output", _qty_el()),
+    ] + _component_blocks(bom, ver) + [_note_block()]
+    return _modal("factory_produce_modal", "完工登记", "确认入库", blocks, meta)
 
 
 def _query_view() -> dict:
@@ -551,14 +621,38 @@ def register_stock_handlers(app: App):
     _opener("factory_scrap_open", lambda: _lot_form_view("scrap", {}))
     _opener("factory_count_open", lambda: _count_view({}))
     _opener("factory_produce_open", lambda: _produce_view({}))
+    _opener("factory_plan_open", lambda: _plan_view({}))
+
+    def _update(body, client, build, change):
+        view = body["view"]
+        meta = _meta(view)
+        change(meta, body["actions"][0])
+        meta["ver"] = meta.get("ver", 0) + 1
+        client.views_update(view_id=view["id"], hash=view["hash"], view=build(meta))
 
     @app.action("factory_pick_bom")
     def pick_bom(ack, body, client):
         ack()
-        view = body["view"]
-        meta = _meta(view)
-        meta["bom_id"] = int(body["actions"][0]["selected_option"]["value"])
-        client.views_update(view_id=view["id"], hash=view["hash"], view=_produce_view(meta))
+        _update(body, client, _produce_view, lambda m, a: m.update(bom_id=int(a["selected_option"]["value"])))
+
+    @app.action("factory_pick_plan")
+    def pick_plan(ack, body, client):
+        ack()
+
+        def change(m, a):
+            mo_id = int(a["selected_option"]["value"])
+            m.update(mode="mo" if mo_id else "direct", mo_id=mo_id, bom_id=None)
+        _update(body, client, _produce_view, change)
+
+    @app.action("factory_plan_bom")
+    def plan_bom(ack, body, client):
+        ack()
+        _update(body, client, _plan_view, lambda m, a: m.update(bom_id=int(a["selected_option"]["value"])))
+
+    @app.action("factory_plan_day")
+    def plan_day(ack, body, client):
+        ack()
+        _update(body, client, _plan_view, lambda m, a: m.update(day=a.get("selected_date")))
 
     @app.action("factory_query_open")
     def open_query(ack, body, client):
@@ -746,23 +840,30 @@ def register_stock_handlers(app: App):
         _decide(body, client, ("count", tuple(ids)), work, "⏳ 待批准", "❌ 已驳回")
 
     # Production — done at once
-    @app.view("factory_produce_modal")
-    def submit_produce(ack, body, client, view):
+    def _actual(v: dict, ver: int) -> dict[int, float]:
+        out = {}
+        suffix = f"_{ver}"
+        for block, val in v.items():
+            if block.startswith("c_") and block.endswith(suffix):
+                raw = val.get("v", {}).get("value")
+                if raw not in (None, ""):
+                    out[int(block[2:-len(suffix)])] = float(raw)
+        return out
+
+    @app.view("factory_plan_modal")
+    def submit_plan(ack, body, client, view):
         import re
         v, errors = view["state"]["values"], {}
         meta = _meta(view)
-        if not meta.get("bom_id"):
-            ack(response_action="errors", errors={"bom": "请先选产品"})
-            return
+        ver = meta.get("ver", 0)
         qty = _qty_value(v, "qty", errors)
-        lot = (v.get("lot", {}).get("v", {}).get("value") or "").strip()
+        lot = (v.get(f"lot_{ver}", {}).get("v", {}).get("value") or "").strip()
         if not re.match(factory.LOT_RE, lot):
-            errors["lot"] = "格式：日期-成品代码-序号，例如 20261020-F01-01"
-        actual = {}
-        for block, val in v.items():
-            raw = val.get("v", {}).get("value") if block.startswith("c_") else None
-            if raw not in (None, ""):
-                actual[int(block[2:])] = float(raw)
+            errors[f"lot_{ver}"] = "格式：日期-成品代码-序号，例如 20261020-F01-01"
+        day_raw = v.get("day", {}).get("factory_plan_day", {}).get("selected_date") or meta.get("day")
+        day = date.fromisoformat(day_raw) if day_raw else factory._today()
+        if day < factory._today():
+            errors["day"] = "生产日期不能早于今天"
         if errors:
             ack(response_action="errors", errors=errors)
             return
@@ -773,18 +874,113 @@ def register_stock_handlers(app: App):
         def _run():
             who = _name(client, user_id)
             try:
-                mo_id = factory.produce(meta["bom_id"], qty, who, note, lot_name=lot, actual=actual)
+                mo_id = factory.plan_production(meta["bom_id"], qty, day, who, note, lot_name=lot)
+                mo = factory.mo_info(mo_id)
+                mats = factory.plan_materials(mo_id)
+                lines = []
+                for m in mats:
+                    free = m["free"]
+                    where = f"配料间 {free.get('Batching Room', 0):g} · 主原料区 {free.get('Main Store', 0):g}"
+                    if free.get("Packaging"):
+                        where += f" · 包材区 {free['Packaging']:g}"
+                    warn = f" ⚠️ *缺 {m['short']:g}*" if m["short"] > 1e-6 else ""
+                    lines.append(f"• {m['product']} *{m['need']:g} {m['uom']}*（可用：{where}）{warn}")
+                text = (f"📝 *生产计划 {mo['name']}* ⏳ 待生产\n{mo['product_id'][1]} — 计划 *{mo['product_qty']:g} {mo['product_uom_id'][1]}* · "
+                        f"生产日期 {mo['day']}\n成品批号 `{mo['lot']}` · 到期 *{mo['expiry']}*（喷码机照这个设）\n备料：\n" + "\n".join(lines)
+                        + (f"\n备注：{note}" if note else ""))
+                resp = client.chat_postMessage(channel=Config.SLACK_CHANNEL_PRODUCTION, text=f"生产计划 {mo['name']}", blocks=[
+                    {"type": "section", "text": {"type": "mrkdwn", "text": text[:2900]}},
+                    {"type": "context", "elements": [{"type": "mrkdwn", "text": f"计划人 {who} · 完工后用「🏭 完工登记」选这张计划"}]},
+                    {"type": "actions", "block_id": "approval", "elements": [
+                        {"type": "button", "action_id": "factory_plan_cancel", "style": "danger", "value": str(mo_id),
+                         "text": {"type": "plain_text", "text": "取消计划"},
+                         "confirm": {"title": {"type": "plain_text", "text": "取消这个计划？"},
+                                     "text": {"type": "mrkdwn", "text": f"{mo['name']} 会被取消，批号 {mo['lot']} 释放。"},
+                                     "confirm": {"type": "plain_text", "text": "取消计划"},
+                                     "deny": {"type": "plain_text", "text": "不取消"}}}]}])
+                try:
+                    from slack.factory_pdf import production_order_pdf
+                    pdf = production_order_pdf(mo, mats, who, note)
+                    client.files_upload_v2(channel=Config.SLACK_CHANNEL_PRODUCTION, thread_ts=resp["ts"],
+                                           file=pdf, filename=f"{mo['name'].replace('/', '-')}_{mo['lot']}.pdf",
+                                           title=f"生产单 {mo['name']}（打印）",
+                                           initial_comment="生产单 / 备料单，打印后交给配料员 · Print for batching")
+                except Exception as e:
+                    logger.error("production order pdf for %s failed: %s", mo_id, e)
+                    client.chat_postMessage(channel=Config.SLACK_CHANNEL_MANAGEMENT, text=f"⚠️ {mo['name']} 生产单 PDF 生成失败：{e}")
+            except Exception as e:
+                _fail(client, user_id, who, "生产计划", e)
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    @app.action("factory_plan_cancel")
+    def plan_cancel(ack, body, client):
+        ack()
+        user_id = body["user"]["id"]
+        if user_id not in Config.FACTORY_USER_IDS and user_id not in Config.FACTORY_ADMIN_IDS:
+            client.chat_postEphemeral(channel=body["channel"]["id"], user=user_id, text="⛔ 你没有权限取消计划。")
+            return
+        mo_id = int(body["actions"][0]["value"])
+        if not _claim(("plan", mo_id)):
+            return
+        who = _name(client, user_id)
+
+        def _run():
+            try:
+                name = factory.cancel_plan(mo_id, who)
+                _close_card(client, body, "⏳ 待生产", "❌ 已取消", f"❌ {who} 已取消计划 {name}")
+            except Exception as e:
+                client.chat_postEphemeral(channel=body["channel"]["id"], user=user_id, text=f"❌ 取消失败：{e}")
+            finally:
+                _release(("plan", mo_id))
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    @app.view("factory_produce_modal")
+    def submit_produce(ack, body, client, view):
+        import re
+        v, errors = view["state"]["values"], {}
+        meta = _meta(view)
+        ver = meta.get("ver", 0)
+        mode = meta.get("mode")
+        if mode not in ("mo", "direct") or (mode == "direct" and not meta.get("bom_id")):
+            ack(response_action="errors", errors={"plan": "请先选计划或产品"})
+            return
+        qty = _qty_value(v, f"qty_{ver}", errors)
+        lot = ""
+        if mode == "direct":
+            lot = (v.get(f"lot_{ver}", {}).get("v", {}).get("value") or "").strip()
+            if not re.match(factory.LOT_RE, lot):
+                errors[f"lot_{ver}"] = "格式：日期-成品代码-序号，例如 20261020-F01-01"
+        actual = _actual(v, ver)
+        if errors:
+            ack(response_action="errors", errors=errors)
+            return
+        ack()
+        user_id = body["user"]["id"]
+        note = (v.get("note", {}).get("v", {}).get("value") or "").strip()
+
+        def _run():
+            who = _name(client, user_id)
+            try:
+                if mode == "mo":
+                    mo_id = factory.finish_production(meta["mo_id"], qty, who, note, actual)
+                else:
+                    mo_id = factory.produce(meta["bom_id"], qty, who, note, lot_name=lot, actual=actual)
                 s = factory.production_summary(mo_id)
-                text = (f"🏭 *生产入库 {s['name']}* ✅ 已入库\n{s['product']} — *{s['qty']:g} {s['uom']}*\n"
+                vs = (f"（计划 {s['planned']:g}，差 {s['qty'] - s['planned']:+g}）"
+                      if mode == "mo" and abs(s["qty"] - s["planned"]) > 1e-6 else "")
+                text = (f"🏭 *完工入库 {s['name']}* ✅ 已入库\n{s['product']} — *{s['qty']:g} {s['uom']}*{vs}\n"
                         f"成品批号：{', '.join(s['lots']) or '—'}\n用料：\n" + "\n".join(f"• {u}" for u in s["used"])
                         + (f"\n实际用量与配方不同：{len(actual)} 项" if actual else "")
+                        + ("" if mode == "mo" else "\n（没有计划，直接登记）")
                         + (f"\n备注：{note}" if note else ""))
                 client.chat_postMessage(channel=Config.SLACK_CHANNEL_PRODUCTION or Config.SLACK_CHANNEL_WAREHOUSE,
-                                        text=f"生产入库 {s['name']}", blocks=[
+                                        text=f"完工入库 {s['name']}", blocks=[
                     {"type": "section", "text": {"type": "mrkdwn", "text": text[:2900]}},
                     {"type": "context", "elements": [{"type": "mrkdwn", "text": f"提交人 {who}"}]}])
             except Exception as e:
-                _fail(client, user_id, who, "生产入库", e)
+                _fail(client, user_id, who, "完工登记", e)
 
         threading.Thread(target=_run, daemon=True).start()
 
