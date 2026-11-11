@@ -400,39 +400,113 @@ def list_boms() -> list[dict]:
     return rows
 
 
-def produce(bom_id: int, qty: float, submitter: str, note: str = "") -> int:
-    """Create an MO from a BOM, consume components (FEFO reservation), produce and close it."""
+# Raw materials come from the Batching Room first, then Main Store; packaging from the
+# Packaging area (manual 4.7 / 4.10). Matched on the English part of the location name.
+PICK_ORDER = ("Batching Room", "Main Store", "Packaging")
+NO_PICK = ("Rejected", "Finished Goods")
+LOT_RE = r"^\d{8}-[A-Za-z0-9]+-\d{2}$"
+
+
+def bom_components(bom_id: int) -> list[dict]:
+    return get_client().search_read("mrp.bom.line", [("bom_id", "=", bom_id)],
+                                    ["product_id", "product_qty", "product_uom_id"], order="sequence, id")
+
+
+def suggest_lot(product_id: int) -> str:
+    """Next finished-goods lot by the manual's rule: date-code-sequence, e.g. 20261020-F01-01."""
+    code = get_client().search_read("product.product", [("id", "=", product_id)], ["default_code"])[0]["default_code"]
+    prefix = f"{_today():%Y%m%d}-{code or product_id}-"
+    names = [l["name"] for l in get_client().search_read(
+        "stock.lot", [("product_id", "=", product_id), ("name", "=like", prefix + "%")], ["name"])]
+    seqs = [int(n[len(prefix):]) for n in names if n[len(prefix):].isdigit()]
+    return f"{prefix}{(max(seqs) + 1 if seqs else 1):02d}"
+
+
+def bom_product(bom_id: int) -> int:
     client = get_client()
-    bom = client.search_read("mrp.bom", [("id", "=", bom_id)], ["product_tmpl_id", "product_id", "product_uom_id"])[0]
-    product_id = bom["product_id"][0] if bom["product_id"] else client.search_read(
+    bom = client.search_read("mrp.bom", [("id", "=", bom_id)], ["product_tmpl_id", "product_id"])[0]
+    return bom["product_id"][0] if bom["product_id"] else client.search_read(
         "product.product", [("product_tmpl_id", "=", bom["product_tmpl_id"][0])], ["id"], limit=1)[0]["id"]
+
+
+def _pick(product_id: int, need: float) -> tuple[list, float]:
+    """Lots/locations to consume `need` from, by PICK_ORDER then earliest expiry; skips expired stock."""
+    today = _today().isoformat()
+    def rank(q):
+        loc = next((i for i, name in enumerate(PICK_ORDER) if name in q["location"]), len(PICK_ORDER))
+        return (loc, q["expiry"] or "9999")
+    quants = [q for q in stock_quants(product_id=product_id, limit=500)
+              if q["free"] > 0 and not any(n in q["location"] for n in NO_PICK)
+              and not (q["expiry"] and q["expiry"] <= today)]
+    picks, left = [], need
+    for q in sorted(quants, key=rank):
+        if left <= 1e-9:
+            break
+        take = min(q["free"], left)
+        picks.append((q, take))
+        left -= take
+    return picks, left
+
+
+def produce(bom_id: int, qty: float, submitter: str, note: str = "", lot_name: str = "",
+            actual: dict[int, float] | None = None) -> int:
+    """Create an MO from a BOM and close it at once.
+
+    `lot_name`: finished-goods lot (manual rule date-code-seq); suggested when empty.
+    `actual`: product_id -> quantity really used, for components that differ from the recipe.
+    Components are taken by PICK_ORDER; on any failure the MO is cancelled.
+    """
+    import re
+    client = get_client()
+    actual = actual or {}
+    bom = client.search_read("mrp.bom", [("id", "=", bom_id)], ["product_uom_id"])[0]
+    product_id = bom_product(bom_id)
+    tracking = client.search_read("product.product", [("id", "=", product_id)], ["tracking"])[0]["tracking"]
+    if tracking == "lot":
+        lot_name = (lot_name or suggest_lot(product_id)).strip()
+        if not re.match(LOT_RE, lot_name):
+            raise RuntimeError(f"成品批号 {lot_name} 格式不对，应为 日期-成品代码-序号，例如 20261020-F01-01")
+        if client.execute("stock.lot", "search_count", [("product_id", "=", product_id), ("name", "=", lot_name)]):
+            raise RuntimeError(f"成品批号 {lot_name} 已经用过了")
     mo_id = client.execute("mrp.production", "create", {
         "product_id": product_id, "bom_id": bom_id, "product_qty": qty,
         "product_uom_id": bom["product_uom_id"][0], "origin": f"Slack · {submitter}",
     })
     try:
         client.execute("mrp.production", "action_confirm", [mo_id])
-        client.execute("mrp.production", "action_assign", [mo_id])
-        short = []
-        for m in client.search_read("stock.move", [("raw_material_production_id", "=", mo_id)],
-                                    ["product_id", "product_uom_qty", "quantity", "product_uom"]):
-            if m["quantity"] + 1e-6 < m["product_uom_qty"]:
-                short.append(f"{m['product_id'][1]} 需要 {m['product_uom_qty']:g}，库存只有 {m['quantity']:g} {m['product_uom'][1]}")
-        if short:
-            raise RuntimeError("原料不够，没有登记：\n" + "\n".join(short))
-        now = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
-        expired = client.search_read("stock.move.line", [("move_id.raw_material_production_id", "=", mo_id),
-                                                         ("lot_id.expiration_date", "<=", now)], ["lot_id", "product_id"])
-        if expired:
-            raise RuntimeError("用到了已过期的原料批次，没有登记：\n" + "\n".join(
-                f"{e['product_id'][1]} · {e['lot_id'][1]}" for e in expired) + "\n请先把过期批次报废。")
-        mo = client.search_read("mrp.production", [("id", "=", mo_id)], ["product_tracking", "lot_producing_ids"])[0]
-        if mo["product_tracking"] == "lot" and not mo["lot_producing_ids"]:
-            client.execute("mrp.production", "action_generate_serial", [mo_id])
+        if tracking == "lot":
+            lot_id = client.execute("stock.lot", "create", {"name": lot_name, "product_id": product_id})
+            client.execute("mrp.production", "write", [mo_id], {"lot_producing_ids": [(6, 0, [lot_id])]})
         client.execute("mrp.production", "write", [mo_id], {"qty_producing": qty})
         client.execute("mrp.production", "set_qty_producing", [mo_id])
-        raw = client.search_read("stock.move", [("raw_material_production_id", "=", mo_id)], ["id"])
-        client.execute("stock.move", "write", [m["id"] for m in raw], {"picked": True})
+        raws = client.search_read("stock.move", [("raw_material_production_id", "=", mo_id)],
+                                  ["id", "product_id", "product_uom_qty", "product_uom", "location_dest_id"])
+        uoms = {p["id"]: p["uom_id"][0] for p in client.search_read(
+            "product.product", [("id", "in", [m["product_id"][0] for m in raws])], ["uom_id"])}
+        short, plan = [], []
+        for m in raws:
+            pid = m["product_id"][0]
+            if m["product_uom"][0] != uoms[pid]:
+                raise RuntimeError(f"{m['product_id'][1]} 的配方单位和库存单位不同，请在 Odoo 处理")
+            need = actual.get(pid, m["product_uom_qty"])
+            picks, left = _pick(pid, need)
+            if left > 1e-6:
+                have = need - left
+                short.append(f"{m['product_id'][1]} 需要 {need:g}，可用库存只有 {have:g} {m['product_uom'][1]}")
+            plan.append((m, picks))
+        if short:
+            raise RuntimeError("原料不够（已过期、不良品区和成品仓的货不算），没有登记：\n" + "\n".join(short))
+        for m, picks in plan:
+            old = client.search_read("stock.move.line", [("move_id", "=", m["id"])], ["id"])
+            if old:
+                client.execute("stock.move.line", "unlink", [o["id"] for o in old])
+            for q, take in picks:
+                client.execute("stock.move.line", "create", {
+                    "move_id": m["id"], "product_id": q["product_id"], "product_uom_id": m["product_uom"][0],
+                    "lot_id": q["lot_id"], "quantity": take, "location_id": q["location_id"],
+                    "location_dest_id": m["location_dest_id"][0], "picked": True,
+                })
+        client.execute("stock.move", "write", [m["id"] for m, _ in plan], {"picked": True})
         client.execute("mrp.production", "button_mark_done", [mo_id], context={"skip_redirection": True,
                                                                                "skip_consumption": True})
         state = client.search_read("mrp.production", [("id", "=", mo_id)], ["state", "name"])[0]
@@ -451,10 +525,10 @@ def production_summary(mo_id: int) -> dict:
                             ["name", "product_id", "qty_produced", "product_uom_id", "lot_producing_ids"])[0]
     lots = client.search_read("stock.lot", [("id", "in", mo["lot_producing_ids"])], ["name", "expiration_date"])
     used = client.search_read("stock.move.line", [("move_id.raw_material_production_id", "=", mo_id)],
-                              ["product_id", "lot_id", "quantity", "product_uom_id"], order="product_id")
+                              ["product_id", "lot_id", "quantity", "product_uom_id", "location_id"], order="product_id")
     return {
         "name": mo["name"], "product": mo["product_id"][1], "qty": mo["qty_produced"], "uom": mo["product_uom_id"][1],
         "lots": [f"{l['name']}" + (f"（到期 {_local_date(l['expiration_date'])}）" if l["expiration_date"] else "") for l in lots],
         "used": [f"{u['product_id'][1]} {u['quantity']:g} {u['product_uom_id'][1]}" + (f" · {u['lot_id'][1]}" if u["lot_id"] else "")
-                 for u in used],
+                 + f" · {_short_loc(u['location_id'][1])}" for u in used],
     }

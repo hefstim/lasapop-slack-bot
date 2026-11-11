@@ -422,19 +422,39 @@ def _count_view(meta: dict) -> dict:
     return _modal("factory_count_modal", "盘点", "提交审批" if meta.get("location_id") else None, blocks, meta)
 
 
-def _produce_view() -> dict:
+def _produce_view(meta: dict) -> dict:
+    """Pick a product (recipe) first; the form then fills in the suggested lot and lists the components."""
     boms = factory.list_boms()
     if not boms:
         return _modal("factory_produce_modal", "生产入库", None, [{"type": "section", "text": {"type": "mrkdwn", "text":
             "还没有配方（BOM）。请管理员先在 Odoo 录入配方，再用这个表单。"}}], {})
     opts = [_option(f"{b['product_tmpl_id'][1]}（配方每 {b['product_qty']:g} {b['product_uom_id'][1]}）"
                     + (f" {b['code']}" if b["code"] else ""), str(b["id"])) for b in boms][:100]
-    blocks = [
-        _input("bom", "产品 / Product", {"type": "static_select", "action_id": "v", "options": opts}),
-        _input("qty", "生产数量（按配方单位）/ Quantity made", _qty_el()),
-        _note_block(),
+    bom_el = {"type": "static_select", "action_id": "factory_pick_bom", "options": opts,
+              "placeholder": {"type": "plain_text", "text": "选择产品"}}
+    init = next((o for o in opts if o["value"] == str(meta.get("bom_id"))), None)
+    if init:
+        bom_el["initial_option"] = init
+    blocks = [_input("bom", "产品 / Product", bom_el, dispatch_action=True)]
+    if not meta.get("bom_id"):
+        blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": "先选产品 · Pick the product first"}]})
+        return _modal("factory_produce_modal", "生产入库", None, blocks, meta)
+    bom = next(b for b in boms if b["id"] == meta["bom_id"])
+    blocks += [
+        _input("lot", "成品批号 / Lot（和喷码机一致）",
+               {"type": "plain_text_input", "action_id": "v", "initial_value": factory.suggest_lot(factory.bom_product(bom["id"]))}),
+        _input("qty", f"实际产量（{bom['product_uom_id'][1]}）/ Quantity made", _qty_el()),
+        {"type": "header", "text": {"type": "plain_text", "text": "实际用量 / Actual use"}},
+        {"type": "context", "elements": [{"type": "mrkdwn", "text":
+            "和配方不同才填，不填就按配方算 · Only fill in when different from the recipe"}]},
     ]
-    return _modal("factory_produce_modal", "生产入库", "确认入库", blocks, {})
+    for c in factory.bom_components(bom["id"]):
+        blocks.append(_input(f"c_{c['product_id'][0]}",
+                             f"{c['product_id'][1]}（配方每 {bom['product_qty']:g} 用 {c['product_qty']:g} {c['product_uom_id'][1]}）"[:150],
+                             {"type": "number_input", "action_id": "v", "is_decimal_allowed": True, "min_value": "0"},
+                             optional=True))
+    blocks.append(_note_block())
+    return _modal("factory_produce_modal", "生产入库", "确认入库", blocks, meta)
 
 
 def _query_view() -> dict:
@@ -511,7 +531,15 @@ def register_stock_handlers(app: App):
     _opener("factory_transfer_open", lambda: _lot_form_view("transfer", {}))
     _opener("factory_scrap_open", lambda: _lot_form_view("scrap", {}))
     _opener("factory_count_open", lambda: _count_view({}))
-    _opener("factory_produce_open", _produce_view)
+    _opener("factory_produce_open", lambda: _produce_view({}))
+
+    @app.action("factory_pick_bom")
+    def pick_bom(ack, body, client):
+        ack()
+        view = body["view"]
+        meta = _meta(view)
+        meta["bom_id"] = int(body["actions"][0]["selected_option"]["value"])
+        client.views_update(view_id=view["id"], hash=view["hash"], view=_produce_view(meta))
 
     @app.action("factory_query_open")
     def open_query(ack, body, client):
@@ -701,23 +729,36 @@ def register_stock_handlers(app: App):
     # Production — done at once
     @app.view("factory_produce_modal")
     def submit_produce(ack, body, client, view):
+        import re
         v, errors = view["state"]["values"], {}
+        meta = _meta(view)
+        if not meta.get("bom_id"):
+            ack(response_action="errors", errors={"bom": "请先选产品"})
+            return
         qty = _qty_value(v, "qty", errors)
+        lot = (v.get("lot", {}).get("v", {}).get("value") or "").strip()
+        if not re.match(factory.LOT_RE, lot):
+            errors["lot"] = "格式：日期-成品代码-序号，例如 20261020-F01-01"
+        actual = {}
+        for block, val in v.items():
+            raw = val.get("v", {}).get("value") if block.startswith("c_") else None
+            if raw not in (None, ""):
+                actual[int(block[2:])] = float(raw)
         if errors:
             ack(response_action="errors", errors=errors)
             return
         ack()
         user_id = body["user"]["id"]
-        bom_id = _selected(v, "bom")
         note = (v.get("note", {}).get("v", {}).get("value") or "").strip()
 
         def _run():
             who = _name(client, user_id)
             try:
-                mo_id = factory.produce(bom_id, qty, who, note)
+                mo_id = factory.produce(meta["bom_id"], qty, who, note, lot_name=lot, actual=actual)
                 s = factory.production_summary(mo_id)
                 text = (f"🏭 *生产入库 {s['name']}* ✅ 已入库\n{s['product']} — *{s['qty']:g} {s['uom']}*\n"
                         f"成品批号：{', '.join(s['lots']) or '—'}\n用料：\n" + "\n".join(f"• {u}" for u in s["used"])
+                        + (f"\n实际用量与配方不同：{len(actual)} 项" if actual else "")
                         + (f"\n备注：{note}" if note else ""))
                 client.chat_postMessage(channel=Config.SLACK_CHANNEL_PRODUCTION or Config.SLACK_CHANNEL_WAREHOUSE,
                                         text=f"生产入库 {s['name']}", blocks=[
